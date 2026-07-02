@@ -19,9 +19,13 @@ jobs:
       # and instruction-dependent asserts skip; isolation and rlimit tests
       # run for real.
       - name: Enable unprivileged user namespaces (bwrap needs them)
+        # The probe mirrors runbox's mount plan (/usr + lib/bin symlinks —
+        # a bare bwrap root has no /bin, and no /lib64 means no ELF loader).
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          bwrap --unshare-all --die-with-parent -- /bin/true && echo "bwrap sandbox OK"
+          bwrap --unshare-all --die-with-parent --ro-bind /usr /usr \
+            --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+            --symlink usr/bin /bin -- /bin/true && echo "bwrap sandbox OK"
       - run: cargo build --release
       - run: pip install pytest
       - run: python -m pytest -v

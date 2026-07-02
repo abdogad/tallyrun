@@ -21,9 +21,12 @@ jobs:
       # Same as ci.yml: the runner image ships the AppArmor unprivileged-userns
       # restriction enabled, which blocks bwrap and fails the whole suite.
       - name: Enable unprivileged user namespaces (bwrap needs them)
+        # Mirrors runbox's mount plan — see ci.yml for why the symlinks matter.
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          bwrap --unshare-all --die-with-parent -- /bin/true && echo "bwrap sandbox OK"
+          bwrap --unshare-all --die-with-parent --ro-bind /usr /usr \
+            --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+            --symlink usr/bin /bin -- /bin/true && echo "bwrap sandbox OK"
       - run: rustup target add x86_64-unknown-linux-musl
       - run: cargo build --release --target x86_64-unknown-linux-musl
       # The pytest suite drives target/release/runbox; point that path at the
