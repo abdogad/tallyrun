@@ -79,6 +79,12 @@ probe-and-fallback ones (`clone3`, `io_uring_*`) return `ENOSYS` so runtimes
 take their normal fallback paths. `--no-seccomp` disables it; `--no-isolate`
 runs never have it (it rides on bwrap).
 
+`/proc` is a fresh procfs scoped to the sandbox's PID namespace, so host PIDs
+are invisible. In a hardened container that forbids a fresh procfs, runbox
+warns on stderr and falls back to a read-only bind of the host `/proc` (host
+PIDs become visible). `--proc-bind` forces the bind; `--proc-fresh` forces
+the fresh mount.
+
 A small, run-to-run-stable bwrap startup offset is included in
 `instructions`; it cancels when limits are calibrated through runbox itself.
 

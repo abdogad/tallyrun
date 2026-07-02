@@ -5,6 +5,28 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-02
+
+### Added
+
+- **Fresh-procfs isolation, default on.** The sandbox now gets a `/proc`
+  scoped to its own PID namespace, so host process IDs and command lines are
+  no longer visible inside it (a read-only bind of the host `/proc` leaked
+  them even through a fresh PID namespace, because procfs reflects the
+  namespace the mount was made in). runbox probes at startup — in a throwaway
+  user+PID+mount namespace, the same way bwrap mounts it — and only where the
+  kernel refuses a fresh procfs (a hardened container whose `/proc` has
+  locked masking mounts, the `mount_too_revealing` check) falls back to the
+  old read-only bind, with a warning. No regression for container
+  deployments; a strict improvement everywhere else.
+- `--proc-bind` (force the host bind, silence the fallback warning) and
+  `--proc-fresh` (force the fresh mount).
+
+### Changed
+
+- Behavior change: by default sandboxed code can no longer enumerate host
+  PIDs via `/proc`. Pass `--proc-bind` for the old behavior.
+
 ## [0.2.0] - 2026-07-02
 
 ### Added
@@ -58,5 +80,6 @@ First release.
 - Reference judge in [examples/minijudge](examples/minijudge); benchmark
   harness in `bench/`; static musl release binary.
 
-[Unreleased]: https://github.com/abdogad/runbox/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/abdogad/runbox/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/abdogad/runbox/releases/tag/v0.3.0
 [0.1.0]: https://github.com/abdogad/runbox/releases/tag/v0.1.0

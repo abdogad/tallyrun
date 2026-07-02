@@ -21,12 +21,14 @@
 //!   --require-cgroup   error out (exit 3) without full cgroup accounting
 //!   --no-isolate       run without bwrap (measurement only; trusted code)
 //!   --no-seccomp       drop the syscall denylist (debugging exotic runtimes)
+//!   --proc-bind        bind host /proc read-only instead of a fresh procfs
+//!   --proc-fresh       force a fresh procfs (error if the kernel refuses)
 //!   -h, --help         print help; -V, --version prints the version
 
 use std::path::PathBuf;
 use std::process::exit;
 
-use runbox::{run, Limits, SandboxSpec};
+use runbox::{run, Limits, ProcMode, SandboxSpec};
 
 const HELP: &str = "\
 runbox - rootless sandbox with load-invariant instruction-count measurement
@@ -59,6 +61,11 @@ OPTIONS:
     --no-seccomp         drop the seccomp syscall denylist that is otherwise
                          loaded into the sandbox (for debugging runtimes that
                          legitimately need an exotic syscall)
+    --proc-bind          bind the host /proc read-only instead of mounting a
+                         fresh procfs. Skips the auto-probe; use inside a
+                         masked-procfs container (accepts host-PID visibility)
+    --proc-fresh         force a fresh procfs; bwrap errors out if the kernel
+                         refuses (default is to probe and fall back to a bind)
     -h, --help           print this help
     -V, --version        print version
 
@@ -139,6 +146,8 @@ fn main() {
             "--require-cgroup" => limits.require_cgroup = true,
             "--no-isolate" => isolate = false,
             "--no-seccomp" => spec.seccomp = false,
+            "--proc-bind" => spec.proc_mode = ProcMode::Bind,
+            "--proc-fresh" => spec.proc_mode = ProcMode::Fresh,
             "--help" | "-h" => {
                 print!("{HELP}");
                 exit(0);

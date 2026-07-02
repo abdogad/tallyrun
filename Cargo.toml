@@ -1,6 +1,6 @@
 [package]
 name = "runbox"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Judge untrusted competitive-programming code on low-variance, load-invariant virtual time (hardware instruction counting) instead of wall/CPU seconds."
 license = "MIT"

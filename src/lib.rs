@@ -79,6 +79,30 @@ impl Default for Limits {
     }
 }
 
+/// How `/proc` is presented inside the sandbox.
+///
+/// A bind of the host `/proc` leaks every host PID (and its cmdline) into the
+/// sandbox even though the process is in its own PID namespace, because
+/// procfs shows the tasks of the namespace the *mount* was created in. A
+/// fresh procfs (bwrap `--proc`) shows only the sandbox's own tree — the
+/// correct isolation — but the kernel refuses to mount one when the existing
+/// `/proc` has locked child mounts (the masked `/proc/*` a hardened container
+/// runtime like Docker adds), the `mount_too_revealing` check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcMode {
+    /// Probe for a fresh procfs and use it; fall back to a read-only bind
+    /// (with a warning) where the kernel forbids it. The right default:
+    /// secure on bare metal / VMs, still works in hardened containers.
+    #[default]
+    Auto,
+    /// Always mount a fresh procfs (`--proc`). bwrap fails loudly if the
+    /// environment forbids it.
+    Fresh,
+    /// Always bind the host `/proc` read-only. Skips the probe; use when you
+    /// know you are in a masked-procfs container and accept the PID leak.
+    Bind,
+}
+
 /// How the sandbox is wired: the work box, whether it's writable (compile step),
 /// and where the three standard streams come from / go.
 #[derive(Debug, Clone)]
@@ -95,6 +119,8 @@ pub struct SandboxSpec {
     /// Load the seccomp denylist (src/seccomp.rs) into the sandbox. Default
     /// true; only rides on bwrap, so `--no-isolate` runs never get a filter.
     pub seccomp: bool,
+    /// How `/proc` is exposed to the sandbox. See [`ProcMode`].
+    pub proc_mode: ProcMode,
     pub stdin: PathBuf,
     pub stdout: PathBuf,
     pub stderr: PathBuf,
@@ -108,6 +134,7 @@ impl Default for SandboxSpec {
             extra_binds: Vec::new(),
             cgroup_dir: None,
             seccomp: true,
+            proc_mode: ProcMode::default(),
             stdin: PathBuf::from("/dev/null"),
             stdout: PathBuf::from("/dev/stdout"),
             stderr: PathBuf::from("/dev/stderr"),
@@ -230,30 +257,106 @@ fn read_counter(fd: c_int) -> Option<u64> {
     (n == 8).then_some(count)
 }
 
+/// Can this environment mount a *fresh* procfs, the way bwrap `--proc` will?
+///
+/// True on bare metal and clean namespaces; false inside a hardened container
+/// whose `/proc` has locked masking mounts (the kernel's
+/// `mount_too_revealing` check refuses a new, less-restricted procfs). We
+/// can't read this reliably from `/proc/self/mountinfo` — whether a submount
+/// is *locked* isn't exposed there — so we probe it directly, exactly the way
+/// bwrap does: in a throwaway child, enter a new user + PID + mount namespace
+/// (unshare(CLONE_NEWUSER) grants full caps there; a PID namespace is
+/// required to mount procfs), then attempt the mount. The child tree exits
+/// immediately and is reaped here, so nothing leaks into the real run.
+fn fresh_proc_available() -> bool {
+    match unsafe { libc::fork() } {
+        -1 => false, // can't probe → caller falls back to the always-safe bind
+        0 => {
+            // child: async-signal-safe syscalls only, then _exit.
+            let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID;
+            if unsafe { libc::unshare(flags) } != 0 {
+                unsafe { libc::_exit(2) }; // no unpriv userns → bwrap won't run either
+            }
+            // The proc mount must be done from *inside* the new PID namespace,
+            // which only children entered by the CLONE_NEWPID unshare are.
+            match unsafe { libc::fork() } {
+                -1 => unsafe { libc::_exit(2) },
+                0 => unsafe {
+                    // Don't let our probe mount propagate back to the host.
+                    libc::mount(
+                        c"none".as_ptr(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    );
+                    let rc = libc::mount(
+                        c"proc".as_ptr(),
+                        c"/proc".as_ptr(),
+                        c"proc".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    );
+                    libc::_exit(if rc == 0 { 0 } else { 1 });
+                },
+                gpid => {
+                    let mut st: c_int = 0;
+                    unsafe { libc::waitpid(gpid, &mut st, 0) };
+                    let code = if libc::WIFEXITED(st) {
+                        libc::WEXITSTATUS(st)
+                    } else {
+                        3
+                    };
+                    unsafe { libc::_exit(code) };
+                }
+            }
+        }
+        pid => {
+            let mut st: c_int = 0;
+            unsafe { libc::waitpid(pid, &mut st, 0) };
+            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
+        }
+    }
+}
+
 /// Build the full argv to exec: bwrap-wrapped when a box is given, else raw.
 /// `seccomp_fd` is a memfd holding the compiled filter, inherited across the
 /// exec for bwrap's `--seccomp FD` (loaded last, so it never constrains
-/// bwrap's own sandbox setup — only the payload subtree).
+/// bwrap's own sandbox setup — only the payload subtree). `fresh_proc` picks
+/// between a fresh procfs (`--proc`, hides host PIDs) and a read-only bind of
+/// the host `/proc` (leaks them, but always mountable) — see [`ProcMode`].
 #[rustfmt::skip] // the bwrap argv reads as a table of (flag, args) rows
-fn build_command(argv: &[String], spec: &SandboxSpec, seccomp_fd: Option<RawFd>) -> Vec<String> {
+fn build_command(
+    argv: &[String],
+    spec: &SandboxSpec,
+    seccomp_fd: Option<RawFd>,
+    fresh_proc: bool,
+) -> Vec<String> {
     let Some(box_dir) = &spec.box_dir else {
         return argv.to_vec();
     };
     let box_bind = if spec.writable { "--bind" } else { "--ro-bind" };
     let box_str = box_dir.to_string_lossy().into_owned();
+    let proc_args: &[&str] = if fresh_proc {
+        &["--proc", "/proc"]
+    } else {
+        &["--ro-bind", "/proc", "/proc"]
+    };
     let mut cmd: Vec<String> = [
         BWRAP, "--unshare-all", "--die-with-parent",
         "--ro-bind", "/usr", "/usr",
         "--symlink", "usr/lib", "/lib",
         "--symlink", "usr/lib64", "/lib64",
         "--symlink", "usr/bin", "/bin",
-        "--ro-bind", "/proc", "/proc",
+    ]
+    .iter()
+    .chain(proc_args)
+    .chain([
         "--dev-bind", "/dev/null", "/dev/null",
         "--dev-bind", "/dev/zero", "/dev/zero",
         "--dev-bind", "/dev/urandom", "/dev/urandom",
         "--dev-bind", "/dev/random", "/dev/random",
-    ]
-    .iter()
+    ].iter())
     .map(|s| s.to_string())
     .collect();
     if let Some(fd) = seccomp_fd {
@@ -333,7 +436,30 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         (Some(_), true) => Some(seccomp::install_fd()?),
         _ => None,
     };
-    let cmd = build_command(argv, spec, seccomp_fd.as_ref().map(|f| f.as_raw_fd()));
+    // Resolve how /proc is presented (only relevant when bwrap is in play).
+    let fresh_proc = spec.box_dir.is_some()
+        && match spec.proc_mode {
+            ProcMode::Fresh => true,
+            ProcMode::Bind => false,
+            ProcMode::Auto => {
+                let ok = fresh_proc_available();
+                if !ok {
+                    eprintln!(
+                        "runbox: warning: cannot mount a fresh /proc here (hardened \
+                         container?); binding host /proc read-only — sandboxed code \
+                         can see host PIDs. Pass --proc-bind to silence, or fix the \
+                         container's /proc masking."
+                    );
+                }
+                ok
+            }
+        };
+    let cmd = build_command(
+        argv,
+        spec,
+        seccomp_fd.as_ref().map(|f| f.as_raw_fd()),
+        fresh_proc,
+    );
 
     // Per-run cgroup: subtree-wide CPU/RSS accounting, a real memory cap, and
     // atomic kill. Degrades loudly to per-process rusage + RLIMIT_AS.
@@ -664,7 +790,10 @@ mod tests {
     #[test]
     fn build_command_no_box_is_passthrough() {
         let argv = args(&["python3", "m.py"]);
-        assert_eq!(build_command(&argv, &SandboxSpec::default(), None), argv);
+        assert_eq!(
+            build_command(&argv, &SandboxSpec::default(), None, true),
+            argv
+        );
     }
 
     #[test]
@@ -673,7 +802,7 @@ mod tests {
             box_dir: Some(PathBuf::from("/tmp/box")),
             ..Default::default()
         };
-        let cmd = build_command(&args(&["python3", "m.py"]), &spec, None);
+        let cmd = build_command(&args(&["python3", "m.py"]), &spec, None, true);
         assert_eq!(cmd[0], BWRAP);
         // Read-only box by default; payload argv comes after the terminator.
         let ro = cmd
@@ -692,7 +821,7 @@ mod tests {
             extra_binds: vec![("/opt/jdk".into(), "/opt/jdk".into(), false)],
             ..Default::default()
         };
-        let cmd = build_command(&args(&["javac", "M.java"]), &spec, None);
+        let cmd = build_command(&args(&["javac", "M.java"]), &spec, None, true);
         assert!(cmd
             .windows(3)
             .any(|w| w == args(&["--bind", "/tmp/box", "/box"])));
@@ -707,9 +836,28 @@ mod tests {
             box_dir: Some(PathBuf::from("/tmp/box")),
             ..Default::default()
         };
-        let with = build_command(&args(&["./a.out"]), &spec, Some(7));
+        let with = build_command(&args(&["./a.out"]), &spec, Some(7), true);
         assert!(with.windows(2).any(|w| w == args(&["--seccomp", "7"])));
-        let without = build_command(&args(&["./a.out"]), &spec, None);
+        let without = build_command(&args(&["./a.out"]), &spec, None, true);
         assert!(!without.iter().any(|a| a == "--seccomp"));
+    }
+
+    #[test]
+    fn build_command_proc_mode_toggles_mount() {
+        let spec = SandboxSpec {
+            box_dir: Some(PathBuf::from("/tmp/box")),
+            ..Default::default()
+        };
+        let fresh = build_command(&args(&["./a.out"]), &spec, None, true);
+        assert!(fresh.windows(2).any(|w| w == args(&["--proc", "/proc"])));
+        assert!(!fresh
+            .windows(3)
+            .any(|w| w == args(&["--ro-bind", "/proc", "/proc"])));
+
+        let bind = build_command(&args(&["./a.out"]), &spec, None, false);
+        assert!(bind
+            .windows(3)
+            .any(|w| w == args(&["--ro-bind", "/proc", "/proc"])));
+        assert!(!bind.iter().any(|a| a == "--proc"));
     }
 }

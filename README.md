@@ -134,14 +134,21 @@ gives runbox its subtree.
   unless `--writable`, for compile steps); tmpfs `/tmp`; `--clearenv` with a
   pinned environment. I/O rides on inherited fds, so the sandbox never sees
   the paths behind stdin/stdout/stderr.
+- **`/proc`:** a fresh procfs scoped to the sandbox's own PID namespace, so
+  host PIDs and their command lines are invisible (a bind of the host `/proc`
+  leaks all of them even through a fresh PID namespace). runbox probes at
+  startup and, only where the kernel forbids a fresh procfs — a hardened
+  container whose `/proc` carries locked masking mounts — falls back to a
+  read-only host bind with a warning. `--proc-bind` forces the bind (and
+  silences the warning); `--proc-fresh` forces the fresh mount.
 - **Resource bounds:** instruction budget + wall-clock safety timeout; a
   per-run cgroup with `memory.max` at 1.25× the limit (real RSS, whole
   subtree — a run between 1.0× and 1.25× is *measured* over-limit, not
   OOM-guessed), `memory.swap.max=0`, `pids.max`, and atomic `cgroup.kill`
   teardown (fork-bomb-proof); rlimits (`CPU`, `NPROC`, `FSIZE`, `NOFILE`) as
   backstops, plus `RLIMIT_AS` when no cgroup is available.
-- **Known limits (roadmap):** the host `/proc` is bind-mounted read-only (a
-  fresh procfs is blocked in a nested userns).
+- **Known limits (roadmap):** no user-facing gaps outstanding; hardening
+  ideas welcome via issues.
 
 ## Status
 
@@ -149,10 +156,9 @@ gives runbox its subtree.
   instruction counting, bwrap isolation, per-run cgroup v2 accounting and
   caps, rlimit backstops, one-line JSON contract
   ([docs/CONTRACT.md](docs/CONTRACT.md)).
-- **Roadmap:** fresh procfs instead of the read-only host `/proc` bind.
-  Done so far: [variance benchmark](docs/BENCHMARK.md), cgroup v2 port,
+- **Done:** [variance benchmark](docs/BENCHMARK.md), cgroup v2 port,
   reference mini-judge, static release binaries (x86-64 + aarch64),
-  seccomp-bpf denylist.
+  seccomp-bpf denylist, fresh-procfs isolation with auto-fallback.
 - **Used by:** [CodeClash](https://github.com/abdogad/code-clash), where
   instruction budgets replaced CPU-time verdicts in production judging.
 

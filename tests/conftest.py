@@ -26,7 +26,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def run_box(box, argv, *, wall=5000, cpu_s=3, mem_kb=131072, insn=None,
-            writable=False, binds=(), stdin=None, no_seccomp=False):
+            writable=False, binds=(), stdin=None, no_seccomp=False,
+            proc_bind=False):
     """Run argv in the sandbox at `box`; return the parsed JSON result with
     the captured stdout text attached as res['_stdout']."""
     box = Path(box)
@@ -45,6 +46,8 @@ def run_box(box, argv, *, wall=5000, cpu_s=3, mem_kb=131072, insn=None,
         cmd += ["--stdin", str(stdin)]
     if no_seccomp:
         cmd += ["--no-seccomp"]
+    if proc_bind:
+        cmd += ["--proc-bind"]
     cmd += ["--", *argv]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     # runbox mirrors the child's exit code, so its own failures (usage error,
