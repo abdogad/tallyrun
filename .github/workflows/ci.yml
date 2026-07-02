@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # bubblewrap + unprivileged userns are available on GitHub's runners.
+      # cgroup delegation and a PMU are not, so cgroup- and instruction-
+      # dependent asserts skip here (those paths are exercised on real hosts
+      # and in the container from deploy/); the isolation and rlimit tests
+      # still run for real.
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - run: cargo build --release
+      - run: pip install pytest
+      - run: python -m pytest -v

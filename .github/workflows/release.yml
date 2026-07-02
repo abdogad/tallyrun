@@ -1,0 +1,45 @@
+name: release
+
+# Tag a commit `v*` (e.g. v0.1.0) and push it: this builds a fully static
+# x86_64 musl binary — it runs on any Linux distro/container regardless of
+# glibc version, which is what deployments (e.g. CodeClash's judge image via
+# get-runbox.sh) download — runs the test suite against it, and attaches
+# binary + checksum to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release + upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools bubblewrap
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      # The pytest suite drives target/release/runbox; point that path at the
+      # musl build so the artifact itself is what gets tested. (cgroup- and
+      # PMU-dependent asserts skip on GitHub runners, as in ci.yml.)
+      - run: |
+          mkdir -p target/release
+          cp target/x86_64-unknown-linux-musl/release/runbox target/release/runbox
+      - run: pip install pytest && python -m pytest -v
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-musl/release
+          cp runbox runbox-x86_64-unknown-linux-musl
+          # Guard the release promise: the artifact must be static.
+          (ldd runbox-x86_64-unknown-linux-musl 2>&1 || true) | grep -Eq 'not a dynamic|statically linked'
+          sha256sum runbox-x86_64-unknown-linux-musl > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "runbox $GITHUB_REF_NAME" \
+            --generate-notes \
+            target/x86_64-unknown-linux-musl/release/runbox-x86_64-unknown-linux-musl \
+            target/x86_64-unknown-linux-musl/release/SHA256SUMS

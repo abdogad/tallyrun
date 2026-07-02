@@ -1,0 +1,4 @@
+# Test tooling only — the engine is the Rust crate (Cargo.toml). The pytest
+# suite drives the release binary through its CLI JSON contract.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
