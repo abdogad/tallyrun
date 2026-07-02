@@ -22,9 +22,11 @@
 //! cancels in limit comparisons; removing it entirely wants native namespaces.
 
 pub mod cgroup;
+pub mod seccomp;
 
 use std::ffi::CString;
 use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::raw::{c_int, c_void};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -90,6 +92,9 @@ pub struct SandboxSpec {
     /// Prepared cgroup dir for per-run children (overrides RUNBOX_CGROUP_DIR
     /// and the self-service vacate dance).
     pub cgroup_dir: Option<PathBuf>,
+    /// Load the seccomp denylist (src/seccomp.rs) into the sandbox. Default
+    /// true; only rides on bwrap, so `--no-isolate` runs never get a filter.
+    pub seccomp: bool,
     pub stdin: PathBuf,
     pub stdout: PathBuf,
     pub stderr: PathBuf,
@@ -102,6 +107,7 @@ impl Default for SandboxSpec {
             writable: false,
             extra_binds: Vec::new(),
             cgroup_dir: None,
+            seccomp: true,
             stdin: PathBuf::from("/dev/null"),
             stdout: PathBuf::from("/dev/stdout"),
             stderr: PathBuf::from("/dev/stderr"),
@@ -225,8 +231,11 @@ fn read_counter(fd: c_int) -> Option<u64> {
 }
 
 /// Build the full argv to exec: bwrap-wrapped when a box is given, else raw.
+/// `seccomp_fd` is a memfd holding the compiled filter, inherited across the
+/// exec for bwrap's `--seccomp FD` (loaded last, so it never constrains
+/// bwrap's own sandbox setup — only the payload subtree).
 #[rustfmt::skip] // the bwrap argv reads as a table of (flag, args) rows
-fn build_command(argv: &[String], spec: &SandboxSpec) -> Vec<String> {
+fn build_command(argv: &[String], spec: &SandboxSpec, seccomp_fd: Option<RawFd>) -> Vec<String> {
     let Some(box_dir) = &spec.box_dir else {
         return argv.to_vec();
     };
@@ -247,6 +256,9 @@ fn build_command(argv: &[String], spec: &SandboxSpec) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if let Some(fd) = seccomp_fd {
+        cmd.extend(["--seccomp".to_string(), fd.to_string()]);
+    }
     cmd.extend([box_bind.to_string(), box_str, "/box".to_string()]);
     for (src, dst, rw) in &spec.extra_binds {
         let flag = if *rw { "--bind" } else { "--ro-bind" };
@@ -315,7 +327,13 @@ fn set_rlimit(res: c_int, soft: u64, hard: u64) {
 /// Run `argv[0]` with the given isolation and limits, measuring its work.
 pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<RunResult> {
     assert!(!argv.is_empty(), "argv must contain at least the program");
-    let cmd = build_command(argv, spec);
+    // The filter memfd rides into the child's exec (bwrap reads it by fd
+    // number); OwnedFd closes the parent's copy on every path after fork.
+    let seccomp_fd: Option<OwnedFd> = match (&spec.box_dir, spec.seccomp) {
+        (Some(_), true) => Some(seccomp::install_fd()?),
+        _ => None,
+    };
+    let cmd = build_command(argv, spec, seccomp_fd.as_ref().map(|f| f.as_raw_fd()));
 
     // Per-run cgroup: subtree-wide CPU/RSS accounting, a real memory cap, and
     // atomic kill. Degrades loudly to per-process rusage + RLIMIT_AS.
@@ -423,6 +441,8 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     }
 
     // ---- parent ----
+    // The child owns its inherited copy of the seccomp memfd; drop ours.
+    drop(seccomp_fd);
     unsafe {
         libc::close(sync_r);
         if own_in {
@@ -644,7 +664,7 @@ mod tests {
     #[test]
     fn build_command_no_box_is_passthrough() {
         let argv = args(&["python3", "m.py"]);
-        assert_eq!(build_command(&argv, &SandboxSpec::default()), argv);
+        assert_eq!(build_command(&argv, &SandboxSpec::default(), None), argv);
     }
 
     #[test]
@@ -653,7 +673,7 @@ mod tests {
             box_dir: Some(PathBuf::from("/tmp/box")),
             ..Default::default()
         };
-        let cmd = build_command(&args(&["python3", "m.py"]), &spec);
+        let cmd = build_command(&args(&["python3", "m.py"]), &spec, None);
         assert_eq!(cmd[0], BWRAP);
         // Read-only box by default; payload argv comes after the terminator.
         let ro = cmd
@@ -672,12 +692,24 @@ mod tests {
             extra_binds: vec![("/opt/jdk".into(), "/opt/jdk".into(), false)],
             ..Default::default()
         };
-        let cmd = build_command(&args(&["javac", "M.java"]), &spec);
+        let cmd = build_command(&args(&["javac", "M.java"]), &spec, None);
         assert!(cmd
             .windows(3)
             .any(|w| w == args(&["--bind", "/tmp/box", "/box"])));
         assert!(cmd
             .windows(3)
             .any(|w| w == args(&["--ro-bind", "/opt/jdk", "/opt/jdk"])));
+    }
+
+    #[test]
+    fn build_command_seccomp_fd_wiring() {
+        let spec = SandboxSpec {
+            box_dir: Some(PathBuf::from("/tmp/box")),
+            ..Default::default()
+        };
+        let with = build_command(&args(&["./a.out"]), &spec, Some(7));
+        assert!(with.windows(2).any(|w| w == args(&["--seccomp", "7"])));
+        let without = build_command(&args(&["./a.out"]), &spec, None);
+        assert!(!without.iter().any(|a| a == "--seccomp"));
     }
 }

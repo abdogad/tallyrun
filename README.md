@@ -25,8 +25,9 @@ normal user — no setuid helper, no privileged container.
 
 Grab the static musl binary from
 [GitHub releases](https://github.com/abdogad/runbox/releases) — it runs on any
-x86-64 Linux (any distro, any container base image), no dependencies beyond a
-`bwrap` binary on the host:
+Linux (any distro, any container base image), no dependencies beyond a
+`bwrap` binary on the host. x86-64 shown; an aarch64 build
+(`runbox-aarch64-unknown-linux-musl`) is attached to the same release:
 
 ```bash
 curl -fL -o runbox https://github.com/abdogad/runbox/releases/latest/download/runbox-x86_64-unknown-linux-musl
@@ -121,6 +122,14 @@ gives runbox its subtree.
 - **Isolation:** `bwrap --unshare-all --die-with-parent` → fresh network (no
   route out), PID, user, IPC, mount, UTS namespaces; unprivileged (rootless
   user namespace), capabilities dropped, `no_new_privs`.
+- **Syscall filter (default on):** a seccomp-bpf denylist closes the kernel's
+  optional attack surface — nested user namespaces (`unshare`/`setns`/
+  `clone(CLONE_NEWUSER)`), `bpf`, `io_uring`, `userfaultfd`, `keyctl`,
+  `ptrace`, `perf_event_open`, mount/module/kexec machinery — while leaving
+  everything real runtimes use untouched (CPython, glibc `clone3→clone`
+  fallback, V8, the JVM, gcc are all exercised under it in the test suite).
+  Probe-and-fallback syscalls return `ENOSYS`, the rest `EPERM`; a foreign
+  audit arch or x32 numbering kills the process. `--no-seccomp` opts out.
 - **Filesystem:** `/usr` read-only plus the work box at `/box` (read-only
   unless `--writable`, for compile steps); tmpfs `/tmp`; `--clearenv` with a
   pinned environment. I/O rides on inherited fds, so the sandbox never sees
@@ -131,9 +140,8 @@ gives runbox its subtree.
   OOM-guessed), `memory.swap.max=0`, `pids.max`, and atomic `cgroup.kill`
   teardown (fork-bomb-proof); rlimits (`CPU`, `NPROC`, `FSIZE`, `NOFILE`) as
   backstops, plus `RLIMIT_AS` when no cgroup is available.
-- **Known limits (roadmap):** no seccomp-bpf syscall filter yet; the host
-  `/proc` is bind-mounted read-only (a fresh procfs is blocked in a nested
-  userns).
+- **Known limits (roadmap):** the host `/proc` is bind-mounted read-only (a
+  fresh procfs is blocked in a nested userns).
 
 ## Status
 
@@ -141,10 +149,10 @@ gives runbox its subtree.
   instruction counting, bwrap isolation, per-run cgroup v2 accounting and
   caps, rlimit backstops, one-line JSON contract
   ([docs/CONTRACT.md](docs/CONTRACT.md)).
-- **Roadmap:** seccomp-bpf syscall allowlist → aarch64 release binary →
-  fresh procfs instead of the read-only host `/proc` bind. Done so far:
-  [variance benchmark](docs/BENCHMARK.md), cgroup v2 port, reference
-  mini-judge, static release binaries.
+- **Roadmap:** fresh procfs instead of the read-only host `/proc` bind.
+  Done so far: [variance benchmark](docs/BENCHMARK.md), cgroup v2 port,
+  reference mini-judge, static release binaries (x86-64 + aarch64),
+  seccomp-bpf denylist.
 - **Used by:** [CodeClash](https://github.com/abdogad/code-clash), where
   instruction budgets replaced CPU-time verdicts in production judging.
 
@@ -156,7 +164,7 @@ gives runbox its subtree.
 | Rootless (no setuid / `--privileged`) | **yes** | setuid root | yes (perf sysctl) | depends on config | privileged container |
 | Verdict basis | **instructions (perf)** | cgroup CPU time | instructions (perf) | wall/CPU time | CPU time (via isolate) |
 | cgroup-v2 memory cap + subtree accounting | **yes** | yes | no (ptrace) | v1/v2 | via isolate |
-| seccomp filter | not yet | no (default) | yes | **yes** | via isolate |
+| seccomp filter | **yes** (kernel-surface denylist) | no (default) | yes | **yes** | via isolate |
 
 **What runbox is:** a small, embeddable, rootless runner with measurement you
 can trust across load — for judges, autograders, and code-execution backends

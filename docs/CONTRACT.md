@@ -73,6 +73,12 @@ PYTHONHASHSEED=0  PYTHONPYCACHEPREFIX=/tmp/pycache
 alone adds ~1.5% instruction-count variance
 ([docs/BENCHMARK.md](BENCHMARK.md), Result 4).
 
+A seccomp-bpf denylist (see the README security model and `src/seccomp.rs`)
+is loaded by default: kernel-attack-surface syscalls return `EPERM`,
+probe-and-fallback ones (`clone3`, `io_uring_*`) return `ENOSYS` so runtimes
+take their normal fallback paths. `--no-seccomp` disables it; `--no-isolate`
+runs never have it (it rides on bwrap).
+
 A small, run-to-run-stable bwrap startup offset is included in
 `instructions`; it cancels when limits are calibrated through runbox itself.
 

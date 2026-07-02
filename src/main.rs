@@ -20,6 +20,7 @@
 //!                      instead of silently degrading to time-based measurement
 //!   --require-cgroup   error out (exit 3) without full cgroup accounting
 //!   --no-isolate       run without bwrap (measurement only; trusted code)
+//!   --no-seccomp       drop the syscall denylist (debugging exotic runtimes)
 //!   -h, --help         print help; -V, --version prints the version
 
 use std::path::PathBuf;
@@ -55,6 +56,9 @@ OPTIONS:
                          silently degrading to time-based measurement
     --require-cgroup     exit 3 without full cgroup accounting
     --no-isolate         run without bwrap (measurement only; trusted code)
+    --no-seccomp         drop the seccomp syscall denylist that is otherwise
+                         loaded into the sandbox (for debugging runtimes that
+                         legitimately need an exotic syscall)
     -h, --help           print this help
     -V, --version        print version
 
@@ -134,6 +138,7 @@ fn main() {
             "--require-insn" => limits.require_insn = true,
             "--require-cgroup" => limits.require_cgroup = true,
             "--no-isolate" => isolate = false,
+            "--no-seccomp" => spec.seccomp = false,
             "--help" | "-h" => {
                 print!("{HELP}");
                 exit(0);

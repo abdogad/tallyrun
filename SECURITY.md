@@ -44,5 +44,7 @@ Explicitly **out of scope**:
   *supposed* to be able to burn its own budget).
 
 Known gaps already on the roadmap (a report is still welcome if you can
-demonstrate impact worse than documented): no seccomp-bpf syscall filter yet;
-the host `/proc` is bind-mounted read-only rather than a fresh procfs.
+demonstrate impact worse than documented): the host `/proc` is bind-mounted
+read-only rather than a fresh procfs. The seccomp filter is a *denylist*
+(documented in `src/seccomp.rs`); a syscall it should cover but doesn't is a
+valid report.

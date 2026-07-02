@@ -1,9 +1,11 @@
 name: release
 
-# Tag a commit `v*` (e.g. v0.1.0) and push it: this builds a fully static
-# x86_64 musl binary — it runs on any Linux distro/container regardless of
-# glibc version, which is what deployments download — runs the test suite
-# against it, and attaches binary + checksum to a GitHub release.
+# Tag a commit `v*` (e.g. v0.1.0) and push it: this builds fully static musl
+# binaries for x86_64 and aarch64 — they run on any Linux distro/container
+# regardless of glibc version, which is what deployments download — runs the
+# test suite against the x86_64 one (the runner's arch; the aarch64 build is
+# compile+static-checked only), and attaches binaries + checksums to a
+# GitHub release.
 on:
   push:
     tags: ["v*"]
@@ -16,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools bubblewrap
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools bubblewrap gcc-aarch64-linux-gnu
       # Same as ci.yml: the runner image ships the AppArmor unprivileged-userns
       # restriction enabled, which blocks bwrap and fails the whole suite.
       - name: Enable unprivileged user namespaces (bwrap needs them)
@@ -26,8 +28,12 @@ jobs:
           bwrap --unshare-all --die-with-parent --ro-bind /usr /usr \
             --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
             --symlink usr/bin /bin -- /bin/true && echo "bwrap sandbox OK"
-      - run: rustup target add x86_64-unknown-linux-musl
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Build aarch64 (cross)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl
       # The pytest suite drives target/release/runbox; point that path at the
       # musl build so the artifact itself is what gets tested. (cgroup- and
       # PMU-dependent asserts skip on GitHub runners, as in ci.yml.)
@@ -37,11 +43,13 @@ jobs:
       - run: pip install pytest && python -m pytest -v
       - name: Package
         run: |
-          cd target/x86_64-unknown-linux-musl/release
-          cp runbox runbox-x86_64-unknown-linux-musl
-          # Guard the release promise: the artifact must be static.
-          (ldd runbox-x86_64-unknown-linux-musl 2>&1 || true) | grep -Eq 'not a dynamic|statically linked'
-          sha256sum runbox-x86_64-unknown-linux-musl > SHA256SUMS
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/runbox dist/runbox-x86_64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/runbox dist/runbox-aarch64-unknown-linux-musl
+          # Guard the release promise: both artifacts must be static.
+          (ldd dist/runbox-x86_64-unknown-linux-musl 2>&1 || true) | grep -Eq 'not a dynamic|statically linked'
+          file dist/runbox-aarch64-unknown-linux-musl | grep -Eq 'aarch64.*(statically linked|static-pie)'
+          cd dist && sha256sum runbox-* > SHA256SUMS
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,5 +57,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "runbox $GITHUB_REF_NAME" \
             --generate-notes \
-            target/x86_64-unknown-linux-musl/release/runbox-x86_64-unknown-linux-musl \
-            target/x86_64-unknown-linux-musl/release/SHA256SUMS
+            dist/runbox-x86_64-unknown-linux-musl \
+            dist/runbox-aarch64-unknown-linux-musl \
+            dist/SHA256SUMS
