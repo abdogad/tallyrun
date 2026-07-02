@@ -78,6 +78,12 @@ if not RUNBOX.exists():
 
 HAVE_CG, HAVE_INSN = _probe()
 
+
+def pytest_report_header(config):
+    # One glance at a CI log answers "what could this host measure?" —
+    # e.g. a broken bwrap shows up as every capability False.
+    return f"runbox capabilities: cgroup={HAVE_CG} instructions={HAVE_INSN}"
+
 needs_cgroup = pytest.mark.skipif(
     not HAVE_CG, reason="cgroup delegation unavailable (accounting=rusage)"
 )

@@ -9,12 +9,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # bubblewrap + unprivileged userns are available on GitHub's runners.
-      # cgroup delegation and a PMU are not, so cgroup- and instruction-
-      # dependent asserts skip here (those paths are exercised on real hosts
-      # and in the container from deploy/); the isolation and rlimit tests
-      # still run for real.
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # Ubuntu 24.04 (and its runner image) ships AppArmor's unprivileged-
+      # userns restriction enabled, which kills bwrap --unshare-all on sight —
+      # disable it like production does (CodeClash deploy/bootstrap-server.sh),
+      # then prove the sandbox actually starts so a regression here fails
+      # loudly on THIS line, not as 12 cryptic test failures.
+      # cgroup delegation and a PMU are still absent on runners, so cgroup-
+      # and instruction-dependent asserts skip; isolation and rlimit tests
+      # run for real.
+      - name: Enable unprivileged user namespaces (bwrap needs them)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --unshare-all --die-with-parent -- /bin/true && echo "bwrap sandbox OK"
       - run: cargo build --release
       - run: pip install pytest
       - run: python -m pytest -v
