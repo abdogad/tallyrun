@@ -14,6 +14,7 @@
 //!   --cpu-s <N>        RLIMIT_CPU backstop seconds (default 10)
 //!   --mem-kb <N>       memory limit: cgroup memory.max at 1.25x (real RSS,
 //!                      whole subtree), or RLIMIT_AS without a cgroup
+//!   --pin-cpu <N>      pin the run to CPU N (cgroup cpuset; kernel-enforced)
 //!   --cgroup-dir <p>   prepared cgroup dir for per-run children (else
 //!                      $RUNBOX_CGROUP_DIR, else the self-service dance)
 //!   --require-insn     error out (exit 3) if perf can't count instructions,
@@ -52,6 +53,9 @@ OPTIONS:
     --cpu-s <N>          RLIMIT_CPU backstop seconds (default 10)
     --mem-kb <N>         memory limit: cgroup memory.max at 1.25x (real RSS,
                          whole subtree), or RLIMIT_AS without a cgroup
+    --pin-cpu <N>        pin the run to CPU N (cgroup cpuset; kernel-enforced,
+                         tree-wide). Give each concurrent worker its own core;
+                         also tightens insn enforcement to 1-core burn rate
     --cgroup-dir <p>     prepared cgroup dir for per-run children (else
                          $RUNBOX_CGROUP_DIR, else self-service setup)
     --require-insn       exit 3 if perf can't count instructions, instead of
@@ -140,6 +144,13 @@ fn main() {
                     val("--mem-kb")
                         .parse()
                         .unwrap_or_else(|_| fail("--mem-kb not an integer")),
+                )
+            }
+            "--pin-cpu" => {
+                limits.pin_cpu = Some(
+                    val("--pin-cpu")
+                        .parse()
+                        .unwrap_or_else(|_| fail("--pin-cpu not a CPU number")),
                 )
             }
             "--require-insn" => limits.require_insn = true,

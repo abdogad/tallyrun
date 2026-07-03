@@ -23,8 +23,9 @@ const INIT_LEAF: &str = "runbox-init";
 // Controller sets to try, richest first. cpu is deliberately not requested:
 // cgroup core maintains cpu.stat's usage_usec on every cgroup regardless, so
 // a bare child cgroup already gives subtree-accurate CPU; controllers are
-// only needed for the memory cap/peak and pids.max.
-const CONTROLLER_SETS: [&str; 2] = ["+memory +pids", "+memory"];
+// only needed for the memory cap/peak, pids.max, and (--pin-cpu only)
+// cpuset.cpus. An enabled-but-unused cpuset constrains nothing.
+const CONTROLLER_SETS: [&str; 3] = ["+memory +pids +cpuset", "+memory +pids", "+memory"];
 const ENABLE_RETRIES: u32 = 20;
 // cgroup.kill is asynchronous: killed tasks linger as "dying" and rmdir
 // returns EBUSY until the kernel reaps them, so removal polls.
@@ -139,6 +140,13 @@ impl RunCgroup {
 
     pub fn set_pids_max(&self, n: u64) {
         let _ = fs::write(self.path.join("pids.max"), n.to_string());
+    }
+
+    /// Pin the subtree to one CPU. Kernel-enforced, unlike sched_setaffinity,
+    /// which any member could simply widen back. Errors surface to the caller
+    /// because the backstop may only assume one core if this took effect.
+    pub fn set_cpus(&self, cpu: u32) -> io::Result<()> {
+        fs::write(self.path.join("cpuset.cpus"), cpu.to_string())
     }
 
     /// Whether the memory controller is live here (memory.max writable).

@@ -59,6 +59,10 @@ pub struct Limits {
     pub max_procs: u64,
     pub max_output_bytes: u64,
     pub max_open_files: u64,
+    /// Pin the run to one CPU (cgroup cpuset — kernel-enforced, tree-wide).
+    /// Serializes multi-threaded payloads; tightens the insn backstop
+    /// to single-core burn rate. Assign each concurrent worker its own core.
+    pub pin_cpu: Option<u32>,
     /// Fail the run instead of degrading when perf can't count instructions.
     /// Judges should set this: a degraded run can't produce a fair verdict.
     pub require_insn: bool,
@@ -76,6 +80,7 @@ impl Default for Limits {
             max_procs: 4096, // NPROC is per-uid; tight values break bwrap's clone()
             max_output_bytes: 8 * 1024 * 1024,
             max_open_files: 64,
+            pin_cpu: None,
             require_insn: false,
             require_cgroup: false,
         }
@@ -560,6 +565,24 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
         c.set_pids_max(limits.max_procs);
     }
+    // Only a *confirmed* pin lets the backstop assume single-core burn rate.
+    let pinned = match (limits.pin_cpu, &cg) {
+        (Some(cpu), Some(c)) => match c.set_cpus(cpu) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "runbox: warning: cpu pinning failed ({e}); running unpinned \
+                     (needs the cpuset controller delegated)"
+                );
+                false
+            }
+        },
+        (Some(_), None) => {
+            eprintln!("runbox: warning: cpu pinning needs a cgroup; running unpinned");
+            false
+        }
+        _ => false,
+    };
     let cg_memory = cg.as_ref().is_some_and(|c| c.has_memory());
     if limits.require_cgroup && !cg_memory {
         return Err(io::Error::new(
@@ -736,7 +759,11 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     // child exit), wall deadline as the timeout. The tripwire kills single-
     // task overruns in-kernel; the backstop read covers multi-process ones.
     let pidfd = pidfd_open(pid);
-    let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64;
+    let cores = if pinned {
+        1
+    } else {
+        unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64
+    };
 
     loop {
         let w = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };

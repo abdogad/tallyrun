@@ -7,6 +7,16 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
 
 ## [0.4.0] - 2026-07-03
 
+### Added
+
+- `--pin-cpu <N>`: pin the run to one CPU via the cgroup cpuset controller
+  (kernel-enforced and tree-wide — the payload cannot widen its own affinity
+  back, unlike `sched_setaffinity`). Intended deployment: one worker per
+  core. A confirmed pin also tightens the instruction backstop to single-core
+  burn rate, cutting worst-case multi-process overshoot ~`nproc`-fold; if the
+  cpuset controller isn't delegated, runbox warns and runs unpinned with the
+  conservative all-core backstop.
+
 ### Changed
 
 - **Event-driven supervision** replaces the fixed 5 ms polling loop. The

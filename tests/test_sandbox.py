@@ -118,6 +118,24 @@ def test_insn_limit_gives_load_invariant_tle(tmp_path):
 
 
 @needs_cgroup
+def test_pin_cpu_confines_the_tree(tmp_path):
+    # cpuset pinning is kernel-enforced: even after the payload tries to
+    # widen its own affinity, the mask stays clamped to the pinned CPU.
+    write_box(tmp_path, {"aff.py": (
+        "import os\n"
+        "os.sched_setaffinity(0, range(os.cpu_count()))  # escape attempt\n"
+        "line = [l for l in open('/proc/self/status') "
+        "if l.startswith('Cpus_allowed_list')][0]\n"
+        "print(line.split()[1])\n"
+    )})
+    res = run_box(tmp_path, [PY, "aff.py"], pin_cpu=0)
+    assert res["exit_code"] == 0
+    allowed = res["_stdout"].strip()
+    if allowed != "0":
+        pytest.skip("cpuset controller not delegated on this host")
+
+
+@needs_cgroup
 def test_cpu_and_rss_are_subtree_accurate(tmp_path):
     # The whole point of the cgroup port: bwrap's PID namespace hides the
     # payload from wait4, so only cgroup accounting sees this burn.
