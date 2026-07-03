@@ -3,15 +3,6 @@
 Notable changes to tallyrun. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behavior).
 
-## [Unreleased]
-
-### Changed
-
-- Renamed the project from `runbox` to `tallyrun` — binary, crate/lib, the
-  `RUNBOX_CGROUP_DIR` env var (→ `TALLYRUN_CGROUP_DIR`), and the internal
-  `runbox-init` cgroup leaf (→ `tallyrun-init`). The CLI surface, JSON
-  contract, exit codes, and flags are unchanged.
-
 ## [0.4.0] - 2026-07-03
 
 ### Added
@@ -26,6 +17,10 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
 
 ### Changed
 
+- Renamed the project from `runbox` to `tallyrun` — binary, crate/lib, the
+  `RUNBOX_CGROUP_DIR` env var (→ `TALLYRUN_CGROUP_DIR`), and the internal
+  `runbox-init` cgroup leaf (→ `tallyrun-init`). The CLI surface, JSON
+  contract, exit codes, and flags are unchanged.
 - **Event-driven supervision** replaces the fixed 5 ms polling loop. The
   supervisor now sleeps in `poll(2)` on a `pidfd` (readable the instant the
   child exits) with the wall deadline as the poll timeout: an idle run costs
