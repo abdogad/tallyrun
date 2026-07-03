@@ -16,6 +16,9 @@
 //! caps and atomic cgroup.kill teardown; wait4 rusage is the fallback when no
 //! cgroup is available (per-process only — the JSON `accounting` field says
 //! which one you got).
+//! Supervision is event-driven, no polling: the parent sleeps in poll(2) on a
+//! pidfd with the wall deadline as timeout, and the instruction limit is a
+//! PMU tripwire — overflow at the budget SIGKILLs the run in-kernel.
 //!
 //! Note: because we count from the bwrap child's exec, a small, roughly-constant
 //! bwrap-setup offset is included in `instructions`. It is stable run-to-run and
@@ -224,31 +227,101 @@ const INHERIT: u64 = 1 << 1;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 const EXCLUDE_HV: u64 = 1 << 6;
 const ENABLE_ON_EXEC: u64 = 1 << 12;
+const PERF_SAMPLE_IP: u64 = 1;
 
-const POLL: Duration = Duration::from_millis(5);
+// fcntl owner ABI (asm-generic); the libc crate doesn't export these.
+const F_SETSIG: c_int = 10;
+const F_SETOWN_EX: c_int = 15;
+const F_OWNER_PGRP: c_int = 2;
+#[repr(C)]
+struct FOwnerEx {
+    r#type: c_int,
+    pid: libc::pid_t,
+}
 
-fn perf_open_instructions(pid: libc::pid_t) -> io::Result<c_int> {
-    let mut attr = PerfEventAttr {
-        r#type: PERF_TYPE_HARDWARE,
-        config: PERF_COUNT_HW_INSTRUCTIONS,
-        flags: DISABLED | INHERIT | EXCLUDE_KERNEL | EXCLUDE_HV | ENABLE_ON_EXEC,
-        ..Default::default()
+/// Fixed supervisor tick when pidfd_open is unavailable (pre-5.3 kernels).
+const NO_PIDFD_TICK: Duration = Duration::from_millis(5);
+
+/// Minimum backstop sleep; caps the re-check rate near the limit.
+const BACKSTOP_FLOOR: Duration = Duration::from_millis(1);
+
+/// Per-core retirement ceiling for backstop sizing (a 2024 desktop core
+/// measures ~14G/s on a plain interpreter loop).
+const PEAK_INSN_RATE_PER_CORE: u64 = 16_000_000_000;
+
+/// Longest sleep such that even every core at peak rate could not burn the
+/// remaining budget before the next aggregate read — forking can't outrun it.
+fn backstop_timeout(remaining_insns: u64, cores: u64) -> Duration {
+    let rate = cores.max(1).saturating_mul(PEAK_INSN_RATE_PER_CORE);
+    let ns = remaining_insns as u128 * 1_000_000_000 / rate as u128;
+    Duration::from_nanos(ns.min(u64::MAX as u128) as u64).max(BACKSTOP_FLOOR)
+}
+
+/// Pollable child-exit fd (Linux 5.3+).
+fn pidfd_open(pid: libc::pid_t) -> Option<c_int> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    (fd >= 0).then_some(fd as c_int)
+}
+
+/// Open a retired-instruction counter for `pid`'s subtree (inherit=1, enabled
+/// at exec). With `kill_at`, the counter is also a tripwire: PMU overflow at
+/// the budget SIGKILLs the run's process group in-kernel — the same
+/// sample_period + fasync mechanism sio2jail uses, delivering SIGKILL
+/// directly instead of SIGIO to a supervisor handler. read() stays the
+/// aggregate tree count.
+///
+/// The period is per-task, so a forking payload can exceed the aggregate
+/// budget untripped, and a setsid() escapee leaves the signalled group; the
+/// backstop read covers both. poll() can't replace the signal: the kernel
+/// forbids the ring-buffer mmap on inherited task events.
+fn perf_open_instructions(pid: libc::pid_t, kill_at: Option<u64>) -> io::Result<c_int> {
+    let open = |period: u64| -> io::Result<c_int> {
+        let mut attr = PerfEventAttr {
+            r#type: PERF_TYPE_HARDWARE,
+            config: PERF_COUNT_HW_INSTRUCTIONS,
+            flags: DISABLED | INHERIT | EXCLUDE_KERNEL | EXCLUDE_HV | ENABLE_ON_EXEC,
+            sample_period_or_freq: period,
+            ..Default::default()
+        };
+        attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
+        if period > 0 {
+            attr.sample_type = PERF_SAMPLE_IP;
+            attr.wakeup_events = 1;
+        }
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                &attr as *const PerfEventAttr as *const c_void,
+                pid,
+                -1i32,
+                -1i32,
+                0u64,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd as c_int)
     };
-    attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_perf_event_open,
-            &attr as *const PerfEventAttr as *const c_void,
-            pid,
-            -1i32,
-            -1i32,
-            0u64,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+    if let Some(limit) = kill_at.filter(|&l| l > 0) {
+        if let Ok(fd) = open(limit) {
+            // Best-effort: if refused, the backstop still enforces.
+            unsafe {
+                let own = FOwnerEx {
+                    r#type: F_OWNER_PGRP,
+                    pid, // the child setsid()s before exec, so pgid == pid
+                };
+                if libc::fcntl(fd, F_SETOWN_EX, &own) == 0
+                    && libc::fcntl(fd, F_SETSIG, libc::SIGKILL) == 0
+                {
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_ASYNC);
+                }
+            }
+            return Ok(fd);
+        }
+        // Some PMUs refuse sampling but allow counting; degrade to count-only.
     }
-    Ok(fd as c_int)
+    open(0)
 }
 
 fn read_counter(fd: c_int) -> Option<u64> {
@@ -608,7 +681,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
 
     // The child is still parked on the sync pipe here, so on a required-perf
     // failure we can kill it before it ever execs the payload.
-    let perf_fd = match perf_open_instructions(pid) {
+    let perf_fd = match perf_open_instructions(pid, limits.insn_limit) {
         Ok(fd) => Some(fd),
         Err(e) if limits.require_insn => {
             unsafe {
@@ -659,38 +732,77 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     let mut killed: Option<&'static str> = None;
     let mut timed_out = false;
 
+    // Event-driven supervision: block in poll(2) on the pidfd (readable at
+    // child exit), wall deadline as the timeout. The tripwire kills single-
+    // task overruns in-kernel; the backstop read covers multi-process ones.
+    let pidfd = pidfd_open(pid);
+    let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64;
+
     loop {
         let w = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
         if w == pid {
-            break; // exited on its own
+            break; // exited on its own, or tripwired (attributed below)
         }
         if w < 0 {
             return Err(io::Error::last_os_error());
         }
+        let mut backstop: Option<Duration> = None;
         if let (Some(fd), Some(limit)) = (perf_fd, limits.insn_limit) {
-            if let Some(c) = read_counter(fd) {
-                if c > limit {
+            match read_counter(fd) {
+                Some(c) if c > limit => {
                     killed = Some("instructions");
                     kill();
                     unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
                     break;
                 }
+                Some(c) => backstop = Some(backstop_timeout(limit - c, cores)),
+                None => backstop = Some(NO_PIDFD_TICK), // unreadable: fixed tick
             }
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             killed = Some("wall");
             timed_out = true;
             kill();
             unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
             break;
         }
-        std::thread::sleep(POLL);
+        let mut timeout = deadline - now;
+        if let Some(b) = backstop {
+            timeout = timeout.min(b);
+        }
+        match pidfd {
+            Some(fd) => {
+                // +1: poll() truncates to whole ms; rounding down would busy-
+                // spin just short of the deadline. Any wake re-runs the checks.
+                let ms = (timeout.as_millis() + 1).min(c_int::MAX as u128) as c_int;
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe { libc::poll(&mut pfd, 1, ms) };
+            }
+            None => std::thread::sleep(timeout.min(NO_PIDFD_TICK)),
+        }
     }
     let wall_ms = start.elapsed().as_millis();
 
     let instructions = perf_fd.and_then(read_counter);
     if let Some(fd) = perf_fd {
         unsafe { libc::close(fd) };
+    }
+    if let Some(fd) = pidfd {
+        unsafe { libc::close(fd) };
+    }
+
+    // A tripwire kill looks like a plain SIGKILL exit; attribute it.
+    if killed.is_none() && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL {
+        if let (Some(c), Some(l)) = (instructions, limits.insn_limit) {
+            if c > l {
+                killed = Some("instructions");
+            }
+        }
     }
 
     // Read cgroup metrics before drop tears the cgroup down; fall back to
@@ -859,5 +971,27 @@ mod tests {
             .windows(3)
             .any(|w| w == args(&["--ro-bind", "/proc", "/proc"])));
         assert!(!bind.iter().any(|a| a == "--proc"));
+    }
+
+    #[test]
+    fn backstop_scales_with_headroom() {
+        // one peak-core-second of headroom on 1 core -> 1s sleep
+        assert_eq!(
+            backstop_timeout(PEAK_INSN_RATE_PER_CORE, 1),
+            Duration::from_secs(1)
+        );
+        // ten cores burn ten times faster -> a tenth of the sleep
+        assert_eq!(
+            backstop_timeout(PEAK_INSN_RATE_PER_CORE, 10),
+            Duration::from_millis(100)
+        );
+        // near-exhausted budgets floor at 1ms rather than busy-spinning
+        assert_eq!(backstop_timeout(0, 16), BACKSTOP_FLOOR);
+        assert_eq!(backstop_timeout(1, 16), BACKSTOP_FLOOR);
+        // a failed sysconf (cores=0) must not divide by zero
+        assert_eq!(
+            backstop_timeout(PEAK_INSN_RATE_PER_CORE, 0),
+            Duration::from_secs(1)
+        );
     }
 }

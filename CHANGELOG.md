@@ -5,6 +5,28 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-03
+
+### Changed
+
+- **Event-driven supervision** replaces the fixed 5 ms polling loop. The
+  supervisor now sleeps in `poll(2)` on a `pidfd` (readable the instant the
+  child exits) with the wall deadline as the poll timeout: an idle run costs
+  a handful of wakeups total instead of 200/s per worker, and wall kills land
+  on the deadline instead of up to 5 ms late. Kernels without `pidfd_open`
+  (< 5.3) fall back to the old tick.
+- **Instruction limits are now enforced in-kernel.** The perf counter is
+  armed with `sample_period = insn_limit`, so the PMU overflow interrupt
+  SIGKILLs the run's process group the moment a task crosses its budget —
+  measured overshoot is thousands of instructions (microseconds), versus up
+  to tens of millions under the 5 ms poll. Because inherited counters clone
+  the period per task, a multi-process payload could split the aggregate
+  budget; a headroom-scaled backstop read covers that: the supervisor never
+  sleeps longer than it would take every core at a generous peak rate to
+  burn the remaining budget, so forking cannot outrun enforcement. The JSON
+  contract is unchanged (`killed:"instructions"`, `signal:9`), and reported
+  counts stay exact in all paths.
+
 ## [0.3.0] - 2026-07-02
 
 ### Added
