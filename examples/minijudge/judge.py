@@ -107,7 +107,7 @@ def main() -> int:
             stat = (f"{used_ms:6d}/{time_ms} ms  {r['peak_kb']:7d}/{mem_kb} kB"
                     + ("  [degraded: CPU time]" if r["measurement"] != "full" else ""))
 
-            if r["killed"] == "instructions" or used_ms > time_ms \
+            if r["killed"] in ("instructions", "cpu") or used_ms > time_ms \
                     or r["timed_out"] or r["signal"] == 24:      # SIGXCPU backstop
                 print(f"TLE  {tin.stem}  {stat}")
                 return 1

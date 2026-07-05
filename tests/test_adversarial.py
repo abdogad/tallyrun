@@ -65,6 +65,30 @@ def test_fork_spread_memory_bomb_is_accounted(tmp_path):
 
 
 @needs_cgroup
+def test_fork_spread_cpu_burn_is_killed(tmp_path):
+    # The CPU-side analogue of the fork-spread memory bomb: 8 children each
+    # burn ~0.5s of CPU — every one under the 1s per-process RLIMIT_CPU, but
+    # ~4s for the subtree against a 1s budget. Only the cgroup cpu.stat
+    # enforcement sees the aggregate; it must kill ("cpu") long before the
+    # wall timeout, which is the load-dependent bound this exists to replace.
+    write_box(tmp_path, {"burn.py":
+        "import os, time\n"
+        "for _ in range(8):\n"
+        "    if os.fork() == 0:\n"
+        "        t = time.process_time()\n"
+        "        while time.process_time() - t < 0.5:\n"
+        "            pass\n"
+        "        os._exit(0)\n"
+        "for _ in range(8):\n"
+        "    os.wait()\n"
+        "print('SURVIVED')\n"})
+    res = run_box(tmp_path, [PY, "burn.py"], cpu_s=1, wall=20000)
+    assert res["killed"] == "cpu"
+    assert "SURVIVED" not in res["_stdout"]
+    assert res["wall_ms"] < 10000  # killed on CPU budget, nowhere near wall
+
+
+@needs_cgroup
 @needs_insn
 def test_fork_bomb_is_contained(tmp_path):
     # perf inherit counts instructions across every forked child, so the bomb

@@ -9,5 +9,7 @@ services:
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    # Without these two lines the sandbox still runs, but falls back to
-    # wall-clock timing (cpu_ms / peak_kb come back None).
+    # Without these two lines the sandbox still runs, but accounting degrades
+    # to per-process rusage ("accounting":"rusage" in the JSON): cpu_ms and
+    # peak_kb stop covering forked children, the memory cap falls back to
+    # RLIMIT_AS, and the subtree CPU budget is not enforced.

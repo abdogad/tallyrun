@@ -3,6 +3,51 @@
 Notable changes to tallyrun. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behavior).
 
+## [Unreleased]
+
+### Added
+
+- **The CPU budget is now enforced subtree-wide.** `--cpu-s` used to be only
+  a per-process `RLIMIT_CPU`, which a payload spreading work across
+  short-lived children never trips — and kernel-mode work is invisible to
+  the instruction counter by design, so a multi-process, syscall-heavy
+  payload was bounded only by the load-dependent wall clock. The supervisor
+  now enforces the same budget on the whole subtree from cgroup `cpu.stat`
+  (new JSON value `killed:"cpu"`), with the read cadence sized so the tree
+  cannot outrun it — the same headroom-scaled scheme as the instruction
+  backstop. `RLIMIT_CPU` stays as the per-process backstop and remains the
+  only CPU bound when no cgroup is available.
+- Seccomp denylist: `pidfd_getfd` (cross-process fd stealing) now returns
+  `EPERM` — same family as `ptrace`/`process_vm_*`. New exhaustive test
+  sweeps every syscall number 0–1023 (with and without `CLONE_NEWUSER` in
+  arg0) and asserts each gets exactly the verdict its table says.
+- `--no-isolate` now prints a loud stderr warning that the command runs
+  directly on the host.
+- CI: `cargo audit` job (RustSec advisory scan).
+
+### Fixed
+
+- The backstop's per-core peak-retirement constant was calibrated on an
+  interpreter loop (~14G insn/s); a high-ILP compiled loop on a fast desktop
+  core retires ~30–35G/s, which widened the worst-case multi-process
+  overshoot window on exactly the hardware a judge wants. Raised to 40G/s.
+- On kernels where `memory.max` exists but `memory.peak` doesn't (5.9–5.18;
+  e.g. RHEL 9's 5.14), the two were conflated: tallyrun applied the
+  `RLIMIT_AS` fallback *alongside* the working cgroup cap, and `RLIMIT_AS`
+  over-counts virtual address space enough to spuriously kill the JVM and
+  CPython. The cap probe and the peak probe are now separate: such kernels
+  keep the real subtree memory cap, and only peak reporting degrades
+  (`accounting:"cpu-only"`).
+- Per-run cgroup names: the `rb-` prefix (a `runbox` leftover) is now `tr-`,
+  and a process-wide counter joins pid+nanos so two threads embedding
+  `tallyrun::run()` cannot collide on a name.
+
+### Changed
+
+- Behavior change: with a cgroup, a run whose *subtree* exceeds `--cpu-s` is
+  killed (`killed:"cpu"`) even when no single process exceeded `RLIMIT_CPU`.
+  Callers that want the old per-process-only semantics can raise `--cpu-s`.
+
 ## [0.4.0] - 2026-07-03
 
 ### Added
@@ -114,6 +159,7 @@ First release.
 - Reference judge in [examples/minijudge](examples/minijudge); benchmark
   harness in `bench/`; static musl release binary.
 
-[Unreleased]: https://github.com/abdogad/tallyrun/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/abdogad/tallyrun/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.4.0
 [0.3.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.3.0
 [0.1.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.1.0

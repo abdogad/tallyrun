@@ -77,6 +77,7 @@ fn deny_eperm() -> Vec<i64> {
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
         libc::SYS_kcmp,
+        libc::SYS_pidfd_getfd, // steal another process's fds; same family
         // mount machinery (old and new API) + escape classics
         libc::SYS_mount,
         libc::SYS_umount2,
@@ -294,6 +295,37 @@ mod tests {
         // plain fork()/pthread_create() flag shapes stay allowed
         assert_eq!(run(libc::SYS_clone, libc::SIGCHLD as u64), RET_ALLOW);
         assert_eq!(run(libc::SYS_clone, 0x3d0f00), RET_ALLOW); // typical thread flags
+    }
+
+    #[test]
+    fn exhaustive_syscall_sweep_matches_the_deny_tables() {
+        // Every syscall number the kernel could present gets exactly the
+        // verdict its table says — a jump off-by-one anywhere in the
+        // assembled program would misroute a neighboring syscall.
+        let p = filter_program();
+        let eperm: Vec<u32> = deny_eperm().iter().map(|&n| n as u32).collect();
+        let enosys: Vec<u32> = deny_enosys().iter().map(|&n| n as u32).collect();
+        for nr in 0..1024u32 {
+            let want = if eperm.contains(&nr) {
+                EPERM
+            } else if enosys.contains(&nr) {
+                ENOSYS
+            } else {
+                RET_ALLOW
+            };
+            assert_eq!(eval(&p, AUDIT_ARCH, nr, 0), want, "syscall {nr}, arg0=0");
+            // With CLONE_NEWUSER in arg0, only clone's verdict may change.
+            let want_flagged = if nr == libc::SYS_clone as u32 {
+                EPERM
+            } else {
+                want
+            };
+            assert_eq!(
+                eval(&p, AUDIT_ARCH, nr, libc::CLONE_NEWUSER as u64),
+                want_flagged,
+                "syscall {nr}, arg0=CLONE_NEWUSER"
+            );
+        }
     }
 
     #[test]

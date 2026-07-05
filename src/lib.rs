@@ -18,7 +18,10 @@
 //! which one you got).
 //! Supervision is event-driven, no polling: the parent sleeps in poll(2) on a
 //! pidfd with the wall deadline as timeout, and the instruction limit is a
-//! PMU tripwire — overflow at the budget SIGKILLs the run in-kernel.
+//! PMU tripwire — overflow at the budget SIGKILLs the run in-kernel. The CPU
+//! budget (`cpu_seconds`) is enforced subtree-wide from cgroup cpu.stat: it
+//! bounds the kernel-mode and fork-spread work the instruction counter
+//! cannot see, without depending on wall-clock load.
 //!
 //! Note: because we count from the bwrap child's exec, a small, roughly-constant
 //! bwrap-setup offset is included in `instructions`. It is stable run-to-run and
@@ -50,7 +53,11 @@ pub struct Limits {
     pub wall_ms: u64,
     /// Kill once retired instructions exceed this (the load-invariant TLE path).
     pub insn_limit: Option<u64>,
-    /// RLIMIT_CPU seconds — a coarse backstop if perf is unavailable.
+    /// CPU-time budget in seconds. With a cgroup this is enforced on the
+    /// whole subtree (cpu.stat, `killed:"cpu"`) — the bound that catches
+    /// multi-process or syscall-heavy work the instruction counter can't see
+    /// (kernel mode is excluded by design). Per-process RLIMIT_CPU is set
+    /// alongside as a backstop and is the only bound without a cgroup.
     pub cpu_seconds: u64,
     /// Memory limit (the MLE verdict threshold). With a cgroup this becomes
     /// memory.max at 1.25x (subtree-wide, real RSS); without one it falls
@@ -157,7 +164,8 @@ pub struct RunResult {
     pub signal: Option<i32>,
     /// The wall-clock safety timeout fired (a genuine hang).
     pub timed_out: bool,
-    /// Why tallyrun killed the process, if it did: "instructions" | "wall".
+    /// Why tallyrun killed the process, if it did:
+    /// "instructions" | "cpu" | "wall".
     pub killed: Option<&'static str>,
     /// Retired user-space instructions — low-variance, load-invariant virtual
     /// time. `None` if perf couldn't open (paranoid setting / no PMU).
@@ -250,9 +258,14 @@ const NO_PIDFD_TICK: Duration = Duration::from_millis(5);
 /// Minimum backstop sleep; caps the re-check rate near the limit.
 const BACKSTOP_FLOOR: Duration = Duration::from_millis(1);
 
-/// Per-core retirement ceiling for backstop sizing (a 2024 desktop core
-/// measures ~14G/s on a plain interpreter loop).
-const PEAK_INSN_RATE_PER_CORE: u64 = 16_000_000_000;
+/// Per-core retirement ceiling for backstop sizing. Must bound the *fastest*
+/// workload class, not a typical one: a high-ILP compiled loop on a 2026
+/// desktop core (~6 GHz, IPC 5–6) retires ~30–35G/s, where an interpreter
+/// loop measures only ~14G/s — sizing to the latter would let a compiled,
+/// forking payload overshoot between backstop reads on exactly the fast
+/// hardware a judge wants. 40G/s adds headroom; the cost of over-estimating
+/// is only more frequent poll timeouts near the budget.
+const PEAK_INSN_RATE_PER_CORE: u64 = 40_000_000_000;
 
 /// Longest sleep such that even every core at peak rate could not burn the
 /// remaining budget before the next aggregate read — forking can't outrun it.
@@ -260,6 +273,14 @@ fn backstop_timeout(remaining_insns: u64, cores: u64) -> Duration {
     let rate = cores.max(1).saturating_mul(PEAK_INSN_RATE_PER_CORE);
     let ns = remaining_insns as u128 * 1_000_000_000 / rate as u128;
     Duration::from_nanos(ns.min(u64::MAX as u128) as u64).max(BACKSTOP_FLOOR)
+}
+
+/// Same idea for the subtree CPU budget: CPU time accrues at most `cores`
+/// CPU-ms per wall-ms, so sleeping `remaining / cores` guarantees the next
+/// cpu.stat read happens before the budget can be exceeded by more than a
+/// few core-milliseconds.
+fn cpu_backstop_timeout(remaining_ms: u64, cores: u64) -> Duration {
+    Duration::from_millis(remaining_ms / cores.max(1)).max(BACKSTOP_FLOOR)
 }
 
 /// Pollable child-exit fd (Linux 5.3+).
@@ -583,8 +604,12 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
         _ => false,
     };
-    let cg_memory = cg.as_ref().is_some_and(|c| c.has_memory());
-    if limits.require_cgroup && !cg_memory {
+    // Cap and peak are probed separately: on 5.9–5.18 kernels memory.max
+    // exists but memory.peak doesn't, and the cap alone must still suppress
+    // the RLIMIT_AS fallback (see has_memory_cap).
+    let cg_mem_cap = cg.as_ref().is_some_and(|c| c.has_memory_cap());
+    let cg_mem_peak = cg.as_ref().is_some_and(|c| c.has_memory_peak());
+    if limits.require_cgroup && !cg_mem_peak {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "cgroup accounting required but the memory controller is not \
@@ -616,7 +641,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     let cpu_seconds = limits.cpu_seconds;
     // RLIMIT_AS (virtual address space) wildly over-counts real RSS; when the
     // cgroup caps real RSS we drop the rlimit entirely (Python parity).
-    let mem_kb = if cg_memory { None } else { limits.mem_kb };
+    let mem_kb = if cg_mem_cap { None } else { limits.mem_kb };
     let max_procs = limits.max_procs;
     let max_output = limits.max_output_bytes;
     let max_files = limits.max_open_files;
@@ -757,13 +782,17 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
 
     // Event-driven supervision: block in poll(2) on the pidfd (readable at
     // child exit), wall deadline as the timeout. The tripwire kills single-
-    // task overruns in-kernel; the backstop read covers multi-process ones.
+    // task overruns in-kernel; the backstop reads cover multi-process ones —
+    // the aggregate instruction count, and the subtree CPU budget (cpu.stat),
+    // which is the only load-independent bound on kernel-mode work the
+    // instruction counter excludes by design.
     let pidfd = pidfd_open(pid);
     let cores = if pinned {
         1
     } else {
         unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u64
     };
+    let cpu_budget_ms = limits.cpu_seconds.saturating_mul(1000);
 
     loop {
         let w = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
@@ -785,6 +814,19 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
                 Some(c) => backstop = Some(backstop_timeout(limit - c, cores)),
                 None => backstop = Some(NO_PIDFD_TICK), // unreadable: fixed tick
             }
+        }
+        // Subtree CPU budget: per-process RLIMIT_CPU can't see a payload
+        // spreading work over short-lived children, and perf can't see
+        // kernel mode; cpu.stat covers both, tree-wide.
+        if let Some(used) = cg.as_ref().and_then(|c| c.cpu_ms()) {
+            if used > cpu_budget_ms {
+                killed = Some("cpu");
+                kill();
+                unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+                break;
+            }
+            let t = cpu_backstop_timeout(cpu_budget_ms - used, cores);
+            backstop = Some(backstop.map_or(t, |b| b.min(t)));
         }
         let now = Instant::now();
         if now >= deadline {
@@ -1020,5 +1062,16 @@ mod tests {
             backstop_timeout(PEAK_INSN_RATE_PER_CORE, 0),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn cpu_backstop_scales_with_headroom() {
+        // 8s of budget on 8 cores can be exhausted in 1s of wall time
+        assert_eq!(cpu_backstop_timeout(8_000, 8), Duration::from_secs(1));
+        assert_eq!(cpu_backstop_timeout(8_000, 1), Duration::from_secs(8));
+        // near-exhausted budgets floor at 1ms rather than busy-spinning
+        assert_eq!(cpu_backstop_timeout(0, 8), BACKSTOP_FLOOR);
+        // a failed sysconf (cores=0) must not divide by zero
+        assert_eq!(cpu_backstop_timeout(8_000, 0), Duration::from_secs(8));
     }
 }

@@ -11,7 +11,9 @@
 //!   --stderr <path>    program stderr            (default inherited stderr)
 //!   --wall-ms <N>      wall-clock safety timeout (default 10000)
 //!   --insn-limit <N>   kill once retired instructions exceed N
-//!   --cpu-s <N>        RLIMIT_CPU backstop seconds (default 10)
+//!   --cpu-s <N>        CPU budget in seconds (default 10): enforced on the
+//!                      whole subtree via cgroup cpu.stat (killed:"cpu"),
+//!                      with per-process RLIMIT_CPU as the backstop
 //!   --mem-kb <N>       memory limit: cgroup memory.max at 1.25x (real RSS,
 //!                      whole subtree), or RLIMIT_AS without a cgroup
 //!   --pin-cpu <N>      pin the run to CPU N (cgroup cpuset; kernel-enforced)
@@ -50,7 +52,11 @@ OPTIONS:
     --stderr <path>      program stderr              (default inherited stderr)
     --wall-ms <N>        wall-clock safety timeout   (default 10000)
     --insn-limit <N>     kill once retired instructions exceed N
-    --cpu-s <N>          RLIMIT_CPU backstop seconds (default 10)
+    --cpu-s <N>          CPU budget in seconds       (default 10): enforced
+                         tree-wide via cgroup cpu.stat (killed:\"cpu\") — the
+                         load-independent bound on the kernel-mode and
+                         fork-spread work instructions can't see; per-process
+                         RLIMIT_CPU rides along as the backstop
     --mem-kb <N>         memory limit: cgroup memory.max at 1.25x (real RSS,
                          whole subtree), or RLIMIT_AS without a cgroup
     --pin-cpu <N>        pin the run to CPU N (cgroup cpuset; kernel-enforced,
@@ -180,6 +186,11 @@ fn main() {
     }
     if !isolate {
         spec.box_dir = None;
+        eprintln!(
+            "tallyrun: warning: --no-isolate: no sandbox, no seccomp — the \
+             command runs directly on the host, bounded only by rlimits and \
+             the cgroup. Trusted code only."
+        );
     } else if spec.box_dir.is_none() {
         fail("isolation needs --box <dir> (or pass --no-isolate for trusted code)");
     }

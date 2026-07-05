@@ -8,14 +8,17 @@
 load-invariant cost measurements — no `--privileged`, no setuid.**
 
 Time-based judging flips verdicts: the same solution that passes on an idle
-judge can TLE on a busy one. [Measured](docs/BENCHMARK.md): the CPU time of an
-identical program varies **up to 48% run-to-run** under a default frequency
-governor and its mean shifts **−16% to +117%** when the machine is loaded.
-tallyrun instead measures work in **retired user-space instructions** — a
-hardware counter (`perf_event_open`) attached across the whole sandboxed
-process tree — which measured **0.00001% RSD for compiled code and a ≤0.25%
-load shift in the worst (JIT) case** on the same machine, because a busy
-judge doesn't make your program execute more instructions.
+judge can TLE on a busy one. [Measured](docs/BENCHMARK.md), both ways: on a
+stock desktop governor the CPU time of an identical program varies **up to
+48% run-to-run**; on a tuned, dedicated judge box (performance governor,
+boost off, idle) that noise collapses to 0.14–1.6% — but the mean still
+shifts **+35–72% the moment the box is loaded**, and one plain C loop kept
+an **8× CPU-time spread even tuned and idle**. tallyrun instead measures
+work in **retired user-space instructions** — a hardware counter
+(`perf_event_open`) attached across the whole sandboxed process tree — which
+held **~1e-7 RSD for compiled code and a ≤0.5% load shift for every runtime
+measured, tuned or not**, because a busy judge doesn't make your program
+execute more instructions.
 
 It's a **small binary you call as a subprocess**: one command in, one JSON
 line out. Isolation is bubblewrap (rootless user namespaces), so it runs as a
@@ -81,8 +84,13 @@ The claim is **low variance and load invariance**, not determinism. Precisely:
   depending on workload. JIT runtimes (V8, JVM) land at 0.05–0.6%. Full
   per-runtime numbers: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 - **Kernel time is invisible.** The counter excludes kernel mode, so
-  syscall-heavy code is undercounted. The `RLIMIT_CPU` backstop is therefore
-  part of the verdict contract, not optional hardening.
+  syscall-heavy code is undercounted — and two correct solutions that split
+  their work differently between user and kernel mode are scored on
+  different scales. The CPU budget (`--cpu-s`) is therefore part of the
+  verdict contract, not optional hardening: with a cgroup it is enforced on
+  the **whole subtree** (`killed:"cpu"`, from `cpu.stat`), bounding the
+  kernel-mode and fork-spread work instructions can't see without falling
+  back to load-dependent wall time.
 - **A constant bwrap-setup offset** (sandbox startup instructions) is included
   in the count. It is stable run-to-run and cancels when limits are calibrated
   through tallyrun itself.
@@ -141,10 +149,14 @@ gives tallyrun its subtree.
 - **Resource bounds:** instruction budget + wall-clock safety timeout; a
   per-run cgroup with `memory.max` at 1.25× the limit (real RSS, whole
   subtree — a run between 1.0× and 1.25× is *measured* over-limit, not
-  OOM-guessed), `memory.swap.max=0`, `pids.max`, and atomic `cgroup.kill`
-  teardown (fork-bomb-proof); rlimits (`CPU`, `NPROC`, `FSIZE`, `NOFILE`) as
-  backstops, plus `RLIMIT_AS` when no cgroup is available.
-- **Known limits (roadmap):** no user-facing gaps outstanding; hardening
+  OOM-guessed), `memory.swap.max=0`, `pids.max`, a subtree-wide CPU budget
+  enforced from `cpu.stat` (`killed:"cpu"` — bounds the kernel-mode and
+  fork-spread work the instruction counter can't see), and atomic
+  `cgroup.kill` teardown (fork-bomb-proof); rlimits (`CPU`, `NPROC`,
+  `FSIZE`, `NOFILE`) as backstops, plus `RLIMIT_AS` when no cgroup memory
+  cap is available.
+- **Known limits:** the threat model — what is in and out of scope, and the
+  documented degradations — lives in [SECURITY.md](SECURITY.md); hardening
   ideas welcome via issues.
 
 ## Status

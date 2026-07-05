@@ -16,6 +16,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -84,7 +85,7 @@ fn vacate_and_enable(base: &Path) -> io::Result<()> {
 /// Find (or prepare) the directory where per-run cgroups may be created.
 /// Never hard-fails over missing controllers: a bare child cgroup still
 /// yields subtree CPU; memory metrics just degrade (visible via
-/// `RunCgroup::has_memory`).
+/// `RunCgroup::has_memory_cap` / `has_memory_peak`).
 pub fn setup(explicit: Option<&Path>) -> io::Result<PathBuf> {
     let env_dir = std::env::var_os("TALLYRUN_CGROUP_DIR").map(PathBuf::from);
     if let Some(dir) = explicit.map(Path::to_path_buf).or(env_dir) {
@@ -122,10 +123,15 @@ pub struct RunCgroup {
 
 impl RunCgroup {
     pub fn create(base: &Path) -> io::Result<RunCgroup> {
+        // pid + counter is unique among live threads of one process (the
+        // embeddable `run()` may race itself); nanos guard against a stale
+        // dir left by a crashed run whose pid got recycled.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        let path = base.join(format!("rb-{}-{nanos}", std::process::id()));
+        let path = base.join(format!("tr-{}-{nanos}-{seq}", std::process::id()));
         fs::create_dir(&path)?;
         Ok(RunCgroup { path })
     }
@@ -149,8 +155,18 @@ impl RunCgroup {
         fs::write(self.path.join("cpuset.cpus"), cpu.to_string())
     }
 
-    /// Whether the memory controller is live here (memory.max writable).
-    pub fn has_memory(&self) -> bool {
+    /// Whether the memory *cap* is live here (memory.max present). Distinct
+    /// from [`has_memory_peak`](Self::has_memory_peak): memory.max landed
+    /// long before memory.peak (kernel 5.19), so a 5.9–5.18 kernel (RHEL 9's
+    /// 5.14) can enforce the cap while peak reporting degrades to rusage —
+    /// conflating the two made such kernels fall back to RLIMIT_AS, which
+    /// over-counts virtual space and spuriously kills the JVM and CPython.
+    pub fn has_memory_cap(&self) -> bool {
+        self.path.join("memory.max").exists()
+    }
+
+    /// Whether peak-RSS reporting is live here (memory.peak, kernel 5.19+).
+    pub fn has_memory_peak(&self) -> bool {
         self.path.join("memory.peak").exists()
     }
 

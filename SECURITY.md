@@ -38,13 +38,17 @@ Explicitly **out of scope**:
   tallyrun falls back to time-based measurement / per-process accounting by
   design, and says so in the JSON (`measurement`, `accounting`).
 - Kernel-mode work is invisible to the counter by design; that is why the
-  RLIMIT_CPU backstop is part of the verdict contract.
+  CPU budget (subtree-wide via cgroup `cpu.stat`, per-process `RLIMIT_CPU`
+  without a cgroup) is part of the verdict contract.
 - `--no-isolate` runs are for trusted code; nothing is claimed for them.
 - Denial of service bounded by the configured limits (a submission is
   *supposed* to be able to burn its own budget).
 
-Known gaps already on the roadmap (a report is still welcome if you can
-demonstrate impact worse than documented): the host `/proc` is bind-mounted
-read-only rather than a fresh procfs. The seccomp filter is a *denylist*
-(documented in `src/seccomp.rs`); a syscall it should cover but doesn't is a
-valid report.
+Known gaps (a report is still welcome if you can demonstrate impact worse
+than documented): in a hardened container whose `/proc` carries locked
+masking mounts, the kernel forbids mounting a fresh procfs and tallyrun falls
+back — with a stderr warning — to a read-only bind of the host `/proc`, so
+host PIDs are visible inside the sandbox there (`--proc-fresh` hard-fails
+instead; everywhere else the sandbox gets a fresh procfs since 0.3.0). The
+seccomp filter is a *denylist* (documented in `src/seccomp.rs`); a syscall
+it should cover but doesn't is a valid report.

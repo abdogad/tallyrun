@@ -36,7 +36,7 @@ every option.
 | `exit_code` | int \| null | the command's exit code; `null` if it was killed by a signal |
 | `signal` | int \| null | the signal that terminated it (e.g. `9` after a limit kill, `24`/SIGXCPU from the RLIMIT_CPU backstop); `null` if it exited normally |
 | `timed_out` | bool | the wall-clock safety timeout fired — a genuine hang (sleep, deadlock, blocked I/O), since a hung program burns no instructions |
-| `killed` | `"instructions"` \| `"wall"` \| null | why **tallyrun** killed the run; `null` when it ended on its own (including OOM kills and rlimit signals) |
+| `killed` | `"instructions"` \| `"cpu"` \| `"wall"` \| null | why **tallyrun** killed the run; `null` when it ended on its own (including OOM kills and rlimit signals) |
 | `instructions` | int \| null | retired user-space instructions summed over the whole process tree — the load-invariant "virtual time". `null` when perf is unavailable |
 | `measurement` | `"full"` \| `"degraded"` | `"degraded"` = no PMU/perf: `instructions` is null and any verdict from this run is time-based and load-dependent. Judges pass `--require-insn` to get exit 3 instead |
 | `accounting` | `"cgroup"` \| `"cpu-only"` \| `"rusage"` | where `cpu_ms`/`peak_kb` came from: `"cgroup"` = whole subtree (trustworthy for multi-process runs); `"cpu-only"` = subtree CPU but per-process memory; `"rusage"` = per-process only — a forking submission is under-accounted. `--require-cgroup` turns anything less than `"cgroup"` into exit 3 |
@@ -51,6 +51,11 @@ every option.
   instructions-per-ms constant calibrated on your hardware
   ([examples/minijudge](../examples/minijudge) uses 2,000,000 — the
   "2 GHz virtual CPU" convention).
+- **TLE (CPU backstop):** `killed == "cpu"` — the whole subtree exceeded the
+  `--cpu-s` budget (cgroup `cpu.stat`). This bounds the work the instruction
+  counter cannot see — kernel-mode time and work spread across short-lived
+  children — without depending on wall-clock load. Without a cgroup only the
+  per-process `RLIMIT_CPU` applies (typically `signal: 24`/SIGXCPU).
 - **MLE:** compare `peak_kb` to your limit. With cgroup accounting the cap is
   set at 1.25× your `--mem-kb`, so a run that lands between 1.0× and 1.25× is
   *measured* over-limit rather than OOM-guessed; at ≥1.25× the kernel
