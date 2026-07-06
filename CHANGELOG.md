@@ -5,6 +5,8 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-06
+
 ### Added
 
 - **The CPU budget is now enforced subtree-wide.** `--cpu-s` used to be only
@@ -159,7 +161,8 @@ First release.
 - Reference judge in [examples/minijudge](examples/minijudge); benchmark
   harness in `bench/`; static musl release binary.
 
-[Unreleased]: https://github.com/abdogad/tallyrun/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/abdogad/tallyrun/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.5.0
 [0.4.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.4.0
 [0.3.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.3.0
 [0.1.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.1.0
