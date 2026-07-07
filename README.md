@@ -9,15 +9,15 @@ did by counting CPU instructions — a number that stays the same whether the
 machine is idle or busy. No `--privileged`, no setuid.**
 
 Judging code by how many seconds it takes is unreliable: CPU time for the
-very same program swings with machine load and CPU frequency scaling, so a
+same program swings with machine load and CPU frequency scaling, so a
 solution that passes on an idle judge can be ruled "too slow" on a busy one.
 tallyrun counts **CPU instructions** instead — a hardware counter
 (`perf_event_open`) attached to the whole sandboxed process tree — and a
 busy machine doesn't make a program execute more instructions.
 [Measured](docs/BENCHMARK.md): on a stock desktop, CPU time for an identical
-compiled program varied up to **48% run-to-run**, while its instruction
-count varied by about **one part in ten million** — and under full machine
-load the count moved **≤0.5%** for every runtime tested.
+compiled program varied up to 48% run-to-run while its instruction count
+varied by about one part in ten million; under full machine load the count
+moved ≤0.5% for every runtime tested.
 
 It's a **small binary you call as a subprocess**: one command in, one JSON
 line out. Isolation is bubblewrap (rootless user namespaces), so it runs as a
@@ -63,13 +63,13 @@ got that (`cgroup`) or the weaker per-process fallback (`rusage`), and
 The full field-by-field contract — every JSON field, every exit code, and
 what is guaranteed stable — is [docs/CONTRACT.md](docs/CONTRACT.md).
 Building a judge on top of it takes ~100 lines of glue:
-[`examples/minijudge`](examples/minijudge) is a complete AC/WA/CE/RE/TLE/MLE
-judge you can run right now.
+[`examples/minijudge`](examples/minijudge) is a complete
+AC/WA/CE/RE/TLE/MLE judge.
 
 ## What instruction counting promises — and what it doesn't
 
-The claim is a **stable, load-independent count**, not a perfect one. The
-honest limits:
+The claim is a stable, load-independent count, not a perfect one. The
+limits:
 
 - **Not bit-exact.** Page faults and interrupts perturb the raw count
   slightly (this is why [rr](https://rr-project.org/) uses retired
@@ -85,19 +85,18 @@ honest limits:
   `PYTHONHASHSEED=0` inside the sandbox, which brings Python down to
   0.0002–0.17% depending on workload. JIT runtimes (V8, JVM) land at
   0.05–0.6%. Full per-runtime numbers: [docs/BENCHMARK.md](docs/BENCHMARK.md).
-- **Kernel time is invisible.** The counter only sees user-mode
+- **Kernel time is invisible.** The counter sees only user-mode
   instructions, so work done inside syscalls isn't counted — syscall-heavy
   code is scored cheaper than compute-heavy code doing the same total work.
-  That's why the CPU budget (`--cpu-s`) is part of the verdict contract, not
-  optional hardening: enforced from the per-run cgroup's `cpu.stat`, it
-  bounds the whole process tree (`killed:"cpu"`), covering the kernel-mode
-  and fork-spread work instructions can't see — without falling back to
+  The CPU budget (`--cpu-s`) closes this gap: enforced from the per-run
+  cgroup's `cpu.stat`, it bounds the whole process tree (`killed:"cpu"`),
+  including kernel-mode and fork-spread work, without falling back to
   load-dependent wall time.
 - **A constant sandbox-startup offset** (bwrap's own setup instructions) is
   included in the count. It's the same every run, so it cancels out when
   limits are calibrated through tallyrun itself.
 
-## Host requirements (read this before deploying)
+## Host requirements
 
 Instruction counting needs unprivileged perf access. Without it tallyrun still
 runs, but reports `"measurement":"degraded"` (with a stderr warning) and falls
@@ -119,7 +118,7 @@ cgroup into a `tallyrun-init` leaf, systemd-style delegation permitting);
 deployments can instead prepare a directory and point `TALLYRUN_CGROUP_DIR` or
 `--cgroup-dir` at it. Without one, accounting degrades to per-process
 `rusage` (reported as `"accounting":"rusage"`; `--require-cgroup` hard-fails
-instead). Two systemd gotchas: run the judge service with
+instead). Two systemd caveats: run the judge service with
 `OOMPolicy=continue`, or systemd stops the whole service when a memory-bomb
 submission gets OOM-killed inside its cap; and `Delegate=yes` on the unit
 gives tallyrun its subtree.
@@ -152,8 +151,7 @@ gives tallyrun its subtree.
   per-run cgroup with `memory.max` at 1.25× the limit (real RSS, whole
   subtree — a run between 1.0× and 1.25× is *measured* over-limit, not
   OOM-guessed), `memory.swap.max=0`, `pids.max`, a subtree-wide CPU budget
-  enforced from `cpu.stat` (`killed:"cpu"` — bounds the kernel-mode and
-  fork-spread work the instruction counter can't see), and atomic
+  enforced from `cpu.stat` (`killed:"cpu"`), and atomic
   `cgroup.kill` teardown (fork-bomb-proof); rlimits (`CPU`, `NPROC`,
   `FSIZE`, `NOFILE`) as backstops, plus `RLIMIT_AS` when no cgroup memory
   cap is available.
@@ -181,9 +179,10 @@ budgets replaced CPU-time verdicts. Ships with a
 | cgroup-v2 memory cap + subtree accounting | **yes** | yes | no (ptrace) | v1/v2 | via isolate |
 | seccomp filter | **yes** (kernel-surface denylist) | no (default) | yes | **yes** | via isolate |
 
-**What tallyrun is:** a small, embeddable, rootless runner with measurement you
-can trust across load — for judges, autograders, and code-execution backends
-running semi-trusted code. **What it isn't:** a hardware isolation boundary.
+**What tallyrun is:** a small, embeddable, rootless runner with
+load-independent measurement — for judges, autograders, and code-execution
+backends running semi-trusted code. **What it isn't:** a hardware isolation
+boundary.
 For fully hostile code, put it behind gVisor or a microVM — but note microVMs
 generally don't expose the PMU, which disables instruction counting.
 
