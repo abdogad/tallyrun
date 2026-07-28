@@ -4,214 +4,242 @@
 [![Release](https://img.shields.io/github/v/release/abdogad/tallyrun)](https://github.com/abdogad/tallyrun/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A rootless Linux sandbox that runs untrusted code and measures the work it
-did by counting CPU instructions — a number that stays the same whether the
-machine is idle or busy. No `--privileged`, no setuid.**
+**Run untrusted code in a rootless Linux sandbox and limit it by CPU
+instructions instead of unreliable wall-clock time.**
 
-Judging code by how many seconds it takes is unreliable: CPU time for the
-same program swings with machine load and CPU frequency scaling, so a
-solution that passes on an idle judge can be ruled "too slow" on a busy one.
-tallyrun counts **CPU instructions** instead — a hardware counter
-(`perf_event_open`) attached to the whole sandboxed process tree — and a
-busy machine doesn't make a program execute more instructions.
-[Measured](docs/BENCHMARK.md): on a stock desktop, CPU time for an identical
-compiled program varied up to 48% run-to-run while its instruction count
-varied by about one part in ten million; under full machine load the count
-moved ≤0.5% for every runtime tested.
+tallyrun is a small command-line tool for online judges, autograders, and
+code-execution services. Give it a command and some resource limits; it runs
+the command in an isolated process tree and returns one line of JSON:
 
-It's a **small binary you call as a subprocess**: one command in, one JSON
-line out. Isolation is bubblewrap (rootless user namespaces), so it runs as a
-normal user — no setuid helper, no privileged container.
-
-## Install
-
-Grab the static musl binary from
-[GitHub releases](https://github.com/abdogad/tallyrun/releases) — it runs on any
-Linux (any distro, any container base image), no dependencies beyond a
-`bwrap` binary on the host. x86-64 shown; an aarch64 build
-(`tallyrun-aarch64-unknown-linux-musl`) is attached to the same release:
-
-```bash
-curl -fL -o tallyrun https://github.com/abdogad/tallyrun/releases/latest/download/tallyrun-x86_64-unknown-linux-musl
-chmod +x tallyrun && sudo mv tallyrun /usr/local/bin/
+```text
+your judge  ->  tallyrun  ->  rootless sandbox  ->  submitted program
+                  |
+                  +---- JSON result (instructions, time, memory, exit status)
 ```
 
-Or install from crates.io with `cargo install tallyrun`, or build from
-source: `cargo build --release`.
+tallyrun handles **one execution**. Your application still decides how to
+compile submissions, compare output, and turn the result into verdicts such as
+AC, WA, TLE, or MLE. See the complete
+[mini-judge example](examples/minijudge) for that integration.
 
-## Quickstart
+## Why count instructions?
+
+A time limit can behave differently on an idle machine and a busy one. CPU
+frequency scaling and competing workloads change how long the same program
+takes to finish.
+
+tallyrun instead counts retired CPU instructions across the sandboxed process
+tree. Machine load may make a run take longer, but it does not make that run do
+more computational work. This gives judges a much more stable basis for a
+"too slow" verdict.
+
+The instruction count is not perfectly exact and is not comparable across
+different CPU models. It is intended to be **stable enough for limits with
+normal headroom**, calibrated on the hardware that will run the judge. The
+[benchmark report](docs/BENCHMARK.md) contains the measurements and caveats.
+
+## Quick start
+
+You need Linux, [bubblewrap](https://github.com/containers/bubblewrap)
+(`bwrap`), and access to the CPU performance counter. See
+[Host setup](#host-setup) if the command reports degraded measurement.
+
+Install the latest x86-64 release:
 
 ```bash
-cargo build --release          # needs bubblewrap (`bwrap`) on the host
-
-mkdir -p /tmp/box && echo 'print(sum(i*i for i in range(10**6)))' > /tmp/box/m.py
-./target/release/tallyrun run --box /tmp/box --insn-limit 10000000000 \
-    --wall-ms 5000 --mem-kb 262144 --require-insn -- python3 m.py
+curl -fL -o tallyrun \
+  https://github.com/abdogad/tallyrun/releases/latest/download/tallyrun-x86_64-unknown-linux-musl
+chmod +x tallyrun
+sudo mv tallyrun /usr/local/bin/
 ```
+
+An aarch64 binary is available from the same
+[release page](https://github.com/abdogad/tallyrun/releases). You can also use
+`cargo install tallyrun` or build this repository with `cargo build --release`.
+
+Create a small program and run it in the sandbox:
+
+```bash
+mkdir -p /tmp/tallyrun-box
+echo 'print(sum(i*i for i in range(10**6)))' > /tmp/tallyrun-box/main.py
+
+tallyrun run \
+  --box /tmp/tallyrun-box \
+  --insn-limit 10000000000 \
+  --wall-ms 5000 \
+  --mem-kb 262144 \
+  --require-insn \
+  -- python3 main.py
+```
+
+The submitted program's output is discarded by default, keeping tallyrun's
+stdout reserved for the result:
 
 ```json
 {"exit_code":0,"signal":null,"timed_out":false,"killed":null,"instructions":1140561942,"measurement":"full","accounting":"cgroup","cpu_ms":116,"wall_ms":117,"peak_kb":5864}
 ```
 
-Exceed `--insn-limit` and the run is killed with `"killed":"instructions"` —
-a "too slow" verdict that doesn't depend on machine load. `--wall-ms` is just
-a safety net for genuine hangs (a blocked program burns no instructions).
-`cpu_ms` and `peak_kb` are measured with a per-run cgroup, so they cover
-every process the submission spawns; `"accounting"` tells you whether you
-got that (`cgroup`) or the weaker per-process fallback (`rusage`), and
-`--require-cgroup` turns the fallback into a hard error.
+The most important fields are:
 
-The full field-by-field contract — every JSON field, every exit code, and
-what is guaranteed stable — is [docs/CONTRACT.md](docs/CONTRACT.md).
-Building a judge on top of it takes ~100 lines of glue:
-[`examples/minijudge`](examples/minijudge) is a complete
-AC/WA/CE/RE/TLE/MLE judge.
+| Field | What it tells you |
+|---|---|
+| `killed` | Which tallyrun limit stopped the run: `instructions`, `cpu`, or `wall` |
+| `instructions` | Retired user-space instructions for the process tree |
+| `measurement` | `full` when instruction counting worked; otherwise `degraded` |
+| `accounting` | `cgroup` for whole-tree accounting, or a weaker fallback |
+| `cpu_ms` / `wall_ms` | CPU time and elapsed time |
+| `peak_kb` | Peak resident memory |
+| `exit_code` / `signal` | How the submitted command ended |
 
-## What instruction counting promises — and what it doesn't
+Use `--stdout <path>` and `--stderr <path>` when your judge needs to capture
+the program's output. The complete, stable interface is documented in the
+[CLI and JSON contract](docs/CONTRACT.md).
 
-The claim is a stable, load-independent count, not a perfect one. The
-limits:
+## What each limit does
 
-- **Not bit-exact.** Page faults and interrupts perturb the raw count
-  slightly (this is why [rr](https://rr-project.org/) uses retired
-  conditional branches for its replay clock). What matters for judging is
-  that verdicts stay stable with normal limit headroom — and ~1e-7 relative
-  noise delivers that.
-- **Not portable across CPU models.** Absolute counts differ between CPU
-  families, so calibrate instruction limits on the hardware that will run
-  the judge — the same way every judge already calibrates time limits per
-  machine.
-- **Interpreted runtimes add their own noise.** CPython's hash randomization
-  alone adds ~1.5% run-to-run variance — as noisy as CPU time. tallyrun pins
-  `PYTHONHASHSEED=0` inside the sandbox, which brings Python down to
-  0.0002–0.17% depending on workload. JIT runtimes (V8, JVM) land at
-  0.05–0.6%. Full per-runtime numbers: [docs/BENCHMARK.md](docs/BENCHMARK.md).
-- **Kernel time is invisible.** The counter sees only user-mode
-  instructions, so work done inside syscalls isn't counted — syscall-heavy
-  code is scored cheaper than compute-heavy code doing the same total work.
-  The CPU budget (`--cpu-s`) closes this gap: enforced from the per-run
-  cgroup's `cpu.stat`, it bounds the whole process tree (`killed:"cpu"`),
-  including kernel-mode and fork-spread work, without falling back to
-  load-dependent wall time.
-- **A constant sandbox-startup offset** (bwrap's own setup instructions) is
-  included in the count. It's the same every run, so it cancels out when
-  limits are calibrated through tallyrun itself.
+No single resource counter catches every kind of runaway program, so tallyrun
+uses several complementary limits:
 
-## Host requirements
+| Option | Purpose |
+|---|---|
+| `--insn-limit N` | Primary, load-independent compute budget |
+| `--cpu-s N` | Bounds kernel work and work spread across processes |
+| `--wall-ms N` | Safety net for sleeping, deadlocked, or blocked programs |
+| `--mem-kb N` | Memory limit and MLE measurement |
+| `--pin-cpu N` | Pins the whole run to one CPU for tighter control |
 
-Instruction counting needs unprivileged perf access. Without it tallyrun still
-runs, but reports `"measurement":"degraded"` (with a stderr warning) and falls
-back to CPU/wall time. Judges should pass `--require-insn` to hard-fail
-instead of silently degrading.
+For a production judge, use `--require-insn` so a missing performance counter
+causes a clear setup error instead of silently falling back to time-based
+measurement. Use `--require-cgroup` when accurate whole-process-tree CPU and
+memory accounting is also required.
 
-- `kernel.perf_event_paranoid` ≤ 2. Fedora ships 2 (works); **Ubuntu ships 4
-  (blocked)** — set `sysctl kernel.perf_event_paranoid=2`.
-- A real PMU. Bare metal or a PMU-enabled VM (KVM's vPMU works — measured on
-  a Hetzner Cloud instance); most CI runners (GitHub Actions included)
-  expose none.
-- In containers, the default Docker/Podman seccomp profiles block
-  `perf_event_open` — run with a profile that allows it.
+Run `tallyrun --help` for every option.
 
-Subtree-accurate `cpu_ms`/`peak_kb` and the real memory cap additionally
-need a **delegated cgroup v2 directory** where tallyrun can create per-run
-children. tallyrun finds one by itself in the common cases (it vacates its own
-cgroup into a `tallyrun-init` leaf, systemd-style delegation permitting);
-deployments can instead prepare a directory and point `TALLYRUN_CGROUP_DIR` or
-`--cgroup-dir` at it. Without one, accounting degrades to per-process
-`rusage` (reported as `"accounting":"rusage"`; `--require-cgroup` hard-fails
-instead). Two systemd caveats: run the judge service with
-`OOMPolicy=continue`, or systemd stops the whole service when a memory-bomb
-submission gets OOM-killed inside its cap; and `Delegate=yes` on the unit
-gives tallyrun its subtree.
+## How the sandbox works
 
-## Security model
+tallyrun combines existing Linux primitives rather than requiring a privileged
+daemon:
 
-- **Isolation:** `bwrap --unshare-all --die-with-parent` → fresh network (no
-  route out), PID, user, IPC, mount, UTS namespaces; unprivileged (rootless
-  user namespace), capabilities dropped, `no_new_privs`.
-- **Syscall filter (default on):** a seccomp-bpf denylist closes the kernel's
-  optional attack surface — nested user namespaces (`unshare`/`setns`/
-  `clone(CLONE_NEWUSER)`), `bpf`, `io_uring`, `userfaultfd`, `keyctl`,
-  `ptrace`, `perf_event_open`, mount/module/kexec machinery — while leaving
-  everything real runtimes use untouched (CPython, glibc `clone3→clone`
-  fallback, V8, the JVM, gcc are all exercised under it in the test suite).
-  Probe-and-fallback syscalls return `ENOSYS`, the rest `EPERM`; a foreign
-  audit arch or x32 numbering kills the process. `--no-seccomp` opts out.
-- **Filesystem:** `/usr` read-only plus the work box at `/box` (read-only
-  unless `--writable`, for compile steps); tmpfs `/tmp`; `--clearenv` with a
-  pinned environment. I/O rides on inherited fds, so the sandbox never sees
-  the paths behind stdin/stdout/stderr.
-- **`/proc`:** a fresh procfs scoped to the sandbox's own PID namespace, so
-  host PIDs and their command lines are invisible (a bind of the host `/proc`
-  leaks all of them even through a fresh PID namespace). tallyrun probes at
-  startup and, only where the kernel forbids a fresh procfs — a hardened
-  container whose `/proc` carries locked masking mounts — falls back to a
-  read-only host bind with a warning. `--proc-bind` forces the bind (and
-  silences the warning); `--proc-fresh` forces the fresh mount.
-- **Resource bounds:** instruction budget + wall-clock safety timeout; a
-  per-run cgroup with `memory.max` at 1.25× the limit (real RSS, whole
-  subtree — a run between 1.0× and 1.25× is *measured* over-limit, not
-  OOM-guessed), `memory.swap.max=0`, `pids.max`, a subtree-wide CPU budget
-  enforced from `cpu.stat` (`killed:"cpu"`), and atomic
-  `cgroup.kill` teardown (fork-bomb-proof); rlimits (`CPU`, `NPROC`,
-  `FSIZE`, `NOFILE`) as backstops, plus `RLIMIT_AS` when no cgroup memory
-  cap is available.
-- **Known limits:** the threat model — what is in and out of scope, and the
-  documented degradations — lives in [SECURITY.md](SECURITY.md); hardening
-  ideas welcome via issues.
+- **bubblewrap** creates new user, PID, network, mount, IPC, and UTS
+  namespaces. The sandbox has no network route.
+- The work directory is mounted at `/box`, read-only by default. Pass
+  `--writable` for a compile step.
+- `/usr` is read-only, `/tmp` is temporary, and the environment is cleared and
+  made deterministic.
+- A default **seccomp** filter blocks syscalls that expose unnecessary kernel
+  attack surface.
+- `perf_event_open` counts user-space instructions for the whole process tree.
+- A delegated **cgroup v2** subtree provides tree-wide CPU and memory
+  accounting, caps, and reliable cleanup of forked processes.
 
-## Status
+This requires neither a setuid helper nor a `--privileged` container.
 
-Working end-to-end. Extracted from
-[CodeClash](https://github.com/abdogad/code-clash), the contest platform it
-was originally built for, where instruction budgets replaced CPU-time
-verdicts. Ships with a
-[variance benchmark](docs/BENCHMARK.md), a reference
-[mini-judge](examples/minijudge), static release binaries
-(x86-64 + aarch64), and a stable one-line JSON contract
-([docs/CONTRACT.md](docs/CONTRACT.md)).
+### Security boundary
 
-## How it compares
+tallyrun is designed for semi-trusted code submitted to judges and
+autograders. It is not a hardware isolation boundary. For fully hostile code,
+add a stronger outer boundary such as gVisor or a microVM; note that an outer
+runtime must expose a performance monitoring unit (PMU) for instruction
+counting to work.
 
-| | tallyrun | isolate | sio2jail | nsjail | Judge0 |
-|---|---|---|---|---|---|
-| Shape | **small binary → 1 JSON line** | binary | binary | binary | HTTP service |
-| Rootless (no setuid / `--privileged`) | **yes** | setuid root | yes (perf sysctl) | depends on config | privileged container |
-| Verdict basis | **instructions (perf)** | cgroup CPU time | instructions (perf) | wall/CPU time | CPU time (via isolate) |
-| cgroup-v2 memory cap + subtree accounting | **yes** | yes | no (ptrace) | v1/v2 | via isolate |
-| seccomp filter | **yes** (kernel-surface denylist) | no (default) | yes | **yes** | via isolate |
+Read [SECURITY.md](SECURITY.md) for the exact threat model, known limitations,
+and private vulnerability-reporting instructions.
 
-**What tallyrun is:** a small, embeddable, rootless runner with
-load-independent measurement — for judges, autograders, and code-execution
-backends running semi-trusted code. **What it isn't:** a hardware isolation
-boundary.
-For fully hostile code, put it behind gVisor or a microVM — but note microVMs
-generally don't expose the PMU, which disables instruction counting.
+## Host setup
 
-## Tests
+### 1. Instruction counting
+
+Instruction counting needs all of the following:
+
+- `kernel.perf_event_paranoid` set to `2` or lower. Fedora commonly ships a
+  usable value; Ubuntu commonly needs
+  `sudo sysctl kernel.perf_event_paranoid=2`.
+- A real PMU, either on bare metal or exposed by the virtual machine.
+- A container seccomp profile that allows `perf_event_open`, if tallyrun itself
+  runs inside a container.
+
+Without access to the counter, tallyrun still runs and returns
+`"measurement":"degraded"` with `instructions: null`. `--require-insn` turns
+this into exit status 3, which is safer for production judges. Many hosted CI
+runners do not expose a PMU, so degraded results there are expected.
+
+### 2. Whole-tree resource accounting
+
+Accurate `cpu_ms`, `peak_kb`, CPU enforcement, and memory enforcement need a
+delegated cgroup v2 directory. tallyrun discovers one automatically in common
+setups. A service can provide one with systemd's `Delegate=yes`, or set
+`TALLYRUN_CGROUP_DIR` / `--cgroup-dir` to a prepared directory.
+
+Without cgroup delegation, tallyrun falls back to per-process `rusage`; the
+JSON `accounting` field makes this visible. Pass `--require-cgroup` if that
+fallback is unacceptable.
+
+For a systemd judge service, also set `OOMPolicy=continue` so an OOM-killed
+submission does not stop the whole service. A reference container setup is in
+[deploy/](deploy).
+
+## Building a judge with tallyrun
+
+A typical judge does the following:
+
+1. Compile the submission in a writable box.
+2. Run the compiled program once per test case in a read-only box.
+3. Parse tallyrun's JSON result.
+4. Check resource limits, exit status, and expected output.
+5. Produce the platform's verdict.
+
+[`examples/minijudge`](examples/minijudge) implements that flow in about 100
+lines of Python, including AC, WA, CE, RE, TLE, and MLE verdicts.
+
+Important integration details:
+
+- Calibrate instruction limits on the same CPU model used by the judge.
+- Leave normal headroom; instruction counts have a small amount of noise.
+- Use the CPU budget to cover syscall-heavy work, because the instruction
+  counter intentionally excludes kernel-mode instructions.
+- Parse the JSON for verdicts. tallyrun's process exit status mirrors the
+  submitted command and is not itself the verdict.
+
+## Measurement limits
+
+- Counts vary slightly because of page faults, interrupts, runtimes, and other
+  nondeterminism.
+- Absolute counts differ across CPU models.
+- JIT and interpreted runtimes introduce more variance than native binaries.
+  tallyrun pins `PYTHONHASHSEED=0` to remove a major source of Python variance.
+- Kernel-mode instructions are not counted; `--cpu-s` is the backstop for that
+  work.
+- The count includes a small, stable bubblewrap startup cost.
+
+See [docs/BENCHMARK.md](docs/BENCHMARK.md) for measured variance under idle
+and loaded conditions and instructions for reproducing the benchmark.
+
+## Development
+
+Build and run the test suites:
 
 ```bash
-cargo build --release        # the suite drives this binary via its JSON contract
-cargo test                   # Rust unit tests
-pip install pytest
+cargo build --release
+cargo test
+python3 -m pip install pytest
 systemd-run --user --scope -q -p OOMPolicy=continue -- python3 -m pytest -v
 ```
 
-(The `systemd-run` wrapper gives the suite a fresh delegated scope and stops
-systemd from killing it when the memory-bomb tests trip the OOM killer; plain
-`pytest -v` also works, with cgroup-dependent asserts skipping if delegation
-is unavailable.)
+Plain `python3 -m pytest -v` also works; tests that require cgroup delegation
+skip when it is unavailable. The Python suite includes adversarial cases such
+as output floods, memory bombs, fork bombs, and infinite loops.
 
-`tests/test_adversarial.py`: output flood, memory bomb, **fork-spread memory
-bomb** (16 × 64 MB vs a 128 MB limit — invisible to per-process accounting,
-caught by the cgroup), fork bomb, infinite loop.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+development workflow and [CHANGELOG.md](CHANGELOG.md) for release history.
 
-## Contributing & security
+## Project documentation
 
-Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Report
-vulnerabilities privately per [SECURITY.md](SECURITY.md). Release history:
-[CHANGELOG.md](CHANGELOG.md).
+- [CLI and JSON contract](docs/CONTRACT.md)
+- [Benchmark methodology and results](docs/BENCHMARK.md)
+- [Complete mini-judge example](examples/minijudge)
+- [Security policy and threat model](SECURITY.md)
+- [Container deployment example](deploy)
 
 ## License
 
-MIT.
+[MIT](LICENSE)
