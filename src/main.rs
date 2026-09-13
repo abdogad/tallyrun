@@ -2,31 +2,8 @@
 //! its instruction count, enforce limits, print one JSON line of results to
 //! stdout. This is the contract a judge consumes as a subprocess (docs/CONTRACT.md).
 //!
-//! OPTIONS:
-//!   --box <dir>        work dir bind-mounted at /box (enables bwrap isolation)
-//!   --writable         bind the box read-write (compile step)
-//!   --bind SRC:DST[:rw]  extra mount layered on /usr (repeatable)
-//!   --stdin <path>     default /dev/null
-//!   --stdout <path>    program stdout            (default /dev/null)
-//!   --stderr <path>    program stderr            (default inherited stderr)
-//!   --wall-ms <N>      wall-clock safety timeout (default 10000)
-//!   --insn-limit <N>   kill once retired instructions exceed N
-//!   --cpu-s <N>        CPU budget in seconds (default 10): enforced on the
-//!                      whole subtree via cgroup cpu.stat (killed:"cpu"),
-//!                      with per-process RLIMIT_CPU as the backstop
-//!   --mem-kb <N>       memory limit: cgroup memory.max at 1.25x (real RSS,
-//!                      whole subtree), or RLIMIT_AS without a cgroup
-//!   --pin-cpu <N>      pin the run to CPU N (cgroup cpuset; kernel-enforced)
-//!   --cgroup-dir <p>   prepared cgroup dir for per-run children (else
-//!                      $TALLYRUN_CGROUP_DIR, else the self-service dance)
-//!   --require-insn     error out (exit 3) if perf can't count instructions,
-//!                      instead of silently degrading to time-based measurement
-//!   --require-cgroup   error out (exit 3) without full cgroup accounting
-//!   --no-isolate       run without bwrap (measurement only; trusted code)
-//!   --no-seccomp       drop the syscall denylist (debugging exotic runtimes)
-//!   --proc-bind        bind host /proc read-only instead of a fresh procfs
-//!   --proc-fresh       force a fresh procfs (error if the kernel refuses)
-//!   -h, --help         print help; -V, --version prints the version
+//! The option list lives once, in `HELP` below, which `--help` prints
+//! verbatim; a second copy here only gave the two something to drift over.
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -96,11 +73,7 @@ fn main() {
         args.next();
     }
 
-    let mut spec = SandboxSpec {
-        stdout: PathBuf::from("/dev/null"),
-        stderr: PathBuf::from("/dev/stderr"),
-        ..Default::default()
-    };
+    let mut spec = SandboxSpec::default();
     let mut limits = Limits::default();
     let mut isolate = true;
     let mut argv: Vec<String> = Vec::new();
@@ -198,7 +171,6 @@ fn main() {
     match run(&argv, &spec, &limits) {
         Ok(r) => {
             println!("{}", r.to_json());
-            // Exit code mirrors the child so shell callers see success/failure too.
             exit(r.exit_code.unwrap_or(1));
         }
         Err(e) => {

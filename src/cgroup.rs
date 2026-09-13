@@ -141,7 +141,10 @@ impl RunCgroup {
     /// over-limit run just runs slowly rather than being caught.
     pub fn set_memory_max(&self, kb: u64) {
         let _ = fs::write(self.path.join("memory.swap.max"), "0");
-        let _ = fs::write(self.path.join("memory.max"), (kb * 1024).to_string());
+        let _ = fs::write(
+            self.path.join("memory.max"),
+            kb.saturating_mul(1024).to_string(),
+        );
     }
 
     pub fn set_pids_max(&self, n: u64) {

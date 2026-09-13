@@ -20,4 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /src/target/release/tallyrun /usr/local/bin/tallyrun
 
 ENTRYPOINT ["tini", "--"]
-CMD ["tallyrun", "run", "--no-isolate", "--stdout", "/dev/stdout", "--", "python3", "-c", "print('tallyrun ready')"]
+# The smoke test greets on stderr: tallyrun's stdout carries the JSON result
+# and the sandboxed program is not allowed to share it.
+CMD ["tallyrun", "run", "--no-isolate", "--", "python3", "-c", "import sys; print('tallyrun ready', file=sys.stderr)"]

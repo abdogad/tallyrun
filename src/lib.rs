@@ -151,7 +151,9 @@ impl Default for SandboxSpec {
             seccomp: true,
             proc_mode: ProcMode::default(),
             stdin: PathBuf::from("/dev/null"),
-            stdout: PathBuf::from("/dev/stdout"),
+            // Discarded, not inherited: tallyrun's own stdout carries the JSON
+            // result, and the payload may not write to it.
+            stdout: PathBuf::from("/dev/null"),
             stderr: PathBuf::from("/dev/stderr"),
         }
     }
@@ -503,16 +505,68 @@ fn resolve_fd(path: &Path, std_fd: RawFd, write: bool) -> io::Result<(RawFd, boo
     }
     let c = CString::new(s.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // O_NOFOLLOW: these paths usually live in the box, which the payload of a
+    // previous run (a --writable compile step) can write to. A symlink planted
+    // there would aim this open — done by the parent, outside the namespaces,
+    // as the host user — at any file that user can reach, truncating it on the
+    // write path and feeding it to the payload's stdin on the read path.
     let (flags, mode) = if write {
-        (libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644)
+        (
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+            0o644,
+        )
     } else {
-        (libc::O_RDONLY, 0)
+        (libc::O_RDONLY | libc::O_NOFOLLOW, 0)
     };
     let fd = unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: stream path is a symlink, refused (it could redirect the \
+                     stream to any file the host user can reach)",
+                    path.display()
+                ),
+            ));
+        }
+        return Err(e);
     }
     Ok((fd, true))
+}
+
+/// Close every descriptor above stderr except `keep`, immediately before exec.
+///
+/// Whatever the caller had open at fork — a log file, a database socket, a
+/// directory handle — is otherwise inherited straight into the sandboxed
+/// payload, and bwrap does not close it either. An inherited *directory* fd is
+/// a plain escape: `openat()` resolves relative to it, walking outside the
+/// mount namespace to read or write anywhere that fd's owner can reach.
+/// `keep` is the seccomp memfd, which bwrap reads by number (-1 for none).
+///
+/// async-signal-safe: raw syscalls only, no allocation.
+unsafe fn close_inherited_fds(keep: c_int, ceiling: c_int) {
+    let range = |lo: u32, hi: u32| -> bool {
+        // An empty range is nothing to do, not a failure; close_range would
+        // reject lo > hi with EINVAL.
+        lo > hi || libc::syscall(libc::SYS_close_range, lo, hi, 0u32) == 0
+    };
+    let closed = if keep > 2 {
+        let k = keep as u32;
+        range(3, k - 1) && range(k + 1, u32::MAX)
+    } else {
+        range(3, u32::MAX)
+    };
+    if closed {
+        return;
+    }
+    // No close_range (pre-5.9): walk the range the caller could have opened.
+    for fd in 3..=ceiling {
+        if fd != keep {
+            libc::close(fd);
+        }
+    }
 }
 
 fn set_rlimit(res: c_int, soft: u64, hard: u64) {
@@ -529,6 +583,20 @@ fn set_rlimit(res: c_int, soft: u64, hard: u64) {
 /// Run `argv[0]` with the given isolation and limits, measuring its work.
 pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<RunResult> {
     assert!(!argv.is_empty(), "argv must contain at least the program");
+    // The payload must never share the stream tallyrun prints its JSON on: a
+    // line it writes there is indistinguishable from the result contract.
+    // `/dev/stdout` is the one path that reaches resolve_fd's inherit case for
+    // fd 1; the `/dev/fd/1` and `/proc/self/fd/1` spellings are symlinks and
+    // O_NOFOLLOW already refuses them.
+    for p in [&spec.stdout, &spec.stderr] {
+        if p.as_os_str() == "/dev/stdout" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "/dev/stdout is reserved for tallyrun's JSON result; \
+                 send the program's output to a file",
+            ));
+        }
+    }
     // The filter memfd rides into the child's exec (bwrap reads it by fd
     // number); OwnedFd closes the parent's copy on every path after fork.
     let seccomp_fd: Option<OwnedFd> = match (&spec.box_dir, spec.seccomp) {
@@ -645,6 +713,15 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     let max_procs = limits.max_procs;
     let max_output = limits.max_output_bytes;
     let max_files = limits.max_open_files;
+    // Snapshot both inputs to the child's fd sweep before fork: the memfd must
+    // survive it (bwrap reads the filter by number), and the fallback ceiling
+    // has to be read while RLIMIT_NOFILE is still the caller's.
+    let keep_fd = seccomp_fd.as_ref().map_or(-1, |f| f.as_raw_fd());
+    let fd_ceiling = {
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE as _, &mut lim) };
+        lim.rlim_max.min(65536) as c_int
+    };
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -682,6 +759,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
             let mut b = [0u8; 1];
             libc::read(sync_r, b.as_mut_ptr() as *mut c_void, 1);
             libc::close(sync_r);
+            close_inherited_fds(keep_fd, fd_ceiling);
             libc::execvp(c_argv[0], c_argv.as_ptr());
             libc::_exit(127);
         }
