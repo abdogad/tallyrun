@@ -28,7 +28,7 @@ every option.
 ## The JSON result
 
 ```json
-{"exit_code":0,"signal":null,"timed_out":false,"killed":null,"instructions":1140561942,"measurement":"full","accounting":"cgroup","cpu_ms":116,"wall_ms":117,"peak_kb":5864}
+{"exit_code":0,"signal":null,"timed_out":false,"killed":null,"instructions":1140561942,"measurement":"full","accounting":"cgroup","cpu_ms":116,"wall_ms":117,"peak_kb":5864,"cpu_us":116532,"cpu_user_us":110000,"cpu_sys_us":6532,"wall_us":117204}
 ```
 
 | field | type | meaning |
@@ -43,6 +43,9 @@ every option.
 | `cpu_ms` | int | CPU time in milliseconds (user+sys) |
 | `wall_ms` | int | wall-clock duration of the run |
 | `peak_kb` | int | peak resident memory in KiB (`memory.peak` for cgroup accounting, `ru_maxrss` otherwise) |
+| `cpu_us` | int | `cpu_ms` in microseconds (same source; `cpu_ms` is this divided by 1000, rounded down) |
+| `cpu_user_us` / `cpu_sys_us` | int | the user-mode / kernel-mode split of `cpu_us`. The total is exact scheduler runtime; the split is tick-sampled and scaled by the kernel to sum to it, so treat it as an estimate for short runs |
+| `wall_us` | int | `wall_ms` in microseconds |
 
 ## Semantics a judge builds on
 

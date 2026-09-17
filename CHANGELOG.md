@@ -5,6 +5,14 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
 
 ## [Unreleased]
 
+### Added
+
+- JSON fields `cpu_us`, `cpu_user_us`, `cpu_sys_us`, and `wall_us`:
+  microsecond CPU and wall time, with CPU split into user and kernel mode.
+  Existing fields are unchanged.
+- `--output-kb <N>` sets the largest file the program may write
+  (`RLIMIT_FSIZE`). The default stays 8 MiB.
+
 ## [0.5.0] - 2026-07-06
 
 ### Added

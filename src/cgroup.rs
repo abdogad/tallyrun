@@ -116,6 +116,21 @@ pub fn setup(explicit: Option<&Path>) -> io::Result<PathBuf> {
     Ok(base)
 }
 
+/// One `name value` line of a flat-keyed cgroup file such as cpu.stat.
+fn stat_field(stat: &str, name: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// CPU time in microseconds: user+system total, and its split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuTimes {
+    pub total: u64,
+    pub user: u64,
+    pub system: u64,
+}
+
 /// A throwaway cgroup for one sandboxed execution.
 pub struct RunCgroup {
     path: PathBuf,
@@ -179,12 +194,19 @@ impl RunCgroup {
 
     pub fn cpu_ms(&self) -> Option<u64> {
         let stat = fs::read_to_string(self.path.join("cpu.stat")).ok()?;
-        for line in stat.lines() {
-            if let Some(v) = line.strip_prefix("usage_usec ") {
-                return v.trim().parse::<u64>().ok().map(|us| us / 1000);
-            }
-        }
-        None
+        stat_field(&stat, "usage_usec").map(|us| us / 1000)
+    }
+
+    /// Subtree CPU time from cpu.stat, in microseconds. `total` is the
+    /// scheduler's exact runtime; the user/system split is tick-sampled and
+    /// scaled by the kernel to sum to it.
+    pub fn cpu_usec(&self) -> Option<CpuTimes> {
+        let stat = fs::read_to_string(self.path.join("cpu.stat")).ok()?;
+        Some(CpuTimes {
+            total: stat_field(&stat, "usage_usec")?,
+            user: stat_field(&stat, "user_usec")?,
+            system: stat_field(&stat, "system_usec")?,
+        })
     }
 
     pub fn peak_kb(&self) -> Option<i64> {
@@ -209,5 +231,22 @@ impl Drop for RunCgroup {
                 Err(_) => std::thread::sleep(RETRY_SLEEP),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_field_matches_whole_keys_only() {
+        let stat = "usage_usec 116532\nuser_usec 110000\nsystem_usec 6532\n\
+                    core_sched.force_idle_usec 0\nnr_periods 0\n";
+        assert_eq!(stat_field(stat, "usage_usec"), Some(116_532));
+        assert_eq!(stat_field(stat, "user_usec"), Some(110_000));
+        assert_eq!(stat_field(stat, "system_usec"), Some(6_532));
+        // a key that is only a prefix of another line must not match it
+        assert_eq!(stat_field(stat, "usage"), None);
+        assert_eq!(stat_field(stat, "missing_usec"), None);
     }
 }

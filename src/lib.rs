@@ -175,6 +175,12 @@ pub struct RunResult {
     pub cpu_ms: u64,
     pub wall_ms: u128,
     pub peak_kb: i64,
+    /// Microsecond forms of `cpu_ms` (with its user/system split) and
+    /// `wall_ms`: 1 ms truncation alone is ±5% on a 20 ms run.
+    pub cpu_us: u64,
+    pub cpu_user_us: u64,
+    pub cpu_sys_us: u64,
+    pub wall_us: u128,
     /// Where cpu_ms/peak_kb came from: "cgroup" (subtree-accurate), "cpu-only"
     /// (cgroup cpu, per-process rusage memory), or "rusage" (per-process only
     /// — multi-process runs are under-accounted).
@@ -203,7 +209,8 @@ impl RunResult {
         format!(
             "{{\"exit_code\":{},\"signal\":{},\"timed_out\":{},\"killed\":{},\
 \"instructions\":{},\"measurement\":\"{}\",\"accounting\":\"{}\",\
-\"cpu_ms\":{},\"wall_ms\":{},\"peak_kb\":{}}}",
+\"cpu_ms\":{},\"wall_ms\":{},\"peak_kb\":{},\
+\"cpu_us\":{},\"cpu_user_us\":{},\"cpu_sys_us\":{},\"wall_us\":{}}}",
             opt_i(self.exit_code),
             opt_i(self.signal),
             self.timed_out,
@@ -214,6 +221,10 @@ impl RunResult {
             self.cpu_ms,
             self.wall_ms,
             self.peak_kb,
+            self.cpu_us,
+            self.cpu_user_us,
+            self.cpu_sys_us,
+            self.wall_us,
         )
     }
 }
@@ -933,7 +944,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
             None => std::thread::sleep(timeout.min(NO_PIDFD_TICK)),
         }
     }
-    let wall_ms = start.elapsed().as_millis();
+    let elapsed = start.elapsed();
 
     let instructions = perf_fd.and_then(read_counter);
     if let Some(fd) = perf_fd {
@@ -956,10 +967,14 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     // wait4 rusage (per-process only) where the cgroup can't answer.
     let (cg_cpu, cg_peak) = cg
         .as_ref()
-        .map_or((None, None), |c| (c.cpu_ms(), c.peak_kb()));
+        .map_or((None, None), |c| (c.cpu_usec(), c.peak_kb()));
     drop(cg);
-    let rusage_cpu = (ru.ru_utime.tv_sec as u64 * 1000 + ru.ru_utime.tv_usec as u64 / 1000)
-        + (ru.ru_stime.tv_sec as u64 * 1000 + ru.ru_stime.tv_usec as u64 / 1000);
+    let tv_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+    let rusage_cpu = cgroup::CpuTimes {
+        total: tv_us(ru.ru_utime) + tv_us(ru.ru_stime),
+        user: tv_us(ru.ru_utime),
+        system: tv_us(ru.ru_stime),
+    };
     let accounting = match (cg_cpu.is_some(), cg_peak.is_some()) {
         (true, true) => "cgroup",
         (true, false) => "cpu-only",
@@ -974,15 +989,20 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         (None, None)
     };
 
+    let cpu = cg_cpu.unwrap_or(rusage_cpu);
     Ok(RunResult {
         exit_code,
         signal,
         timed_out,
         killed,
         instructions,
-        cpu_ms: cg_cpu.unwrap_or(rusage_cpu),
-        wall_ms,
+        cpu_ms: cpu.total / 1000,
+        wall_ms: elapsed.as_millis(),
         peak_kb: cg_peak.unwrap_or(ru.ru_maxrss),
+        cpu_us: cpu.total,
+        cpu_user_us: cpu.user,
+        cpu_sys_us: cpu.system,
+        wall_us: elapsed.as_micros(),
         accounting,
     })
 }
@@ -1001,6 +1021,10 @@ mod tests {
             cpu_ms: 116,
             wall_ms: 117,
             peak_kb: 5864,
+            cpu_us: 116_532,
+            cpu_user_us: 110_000,
+            cpu_sys_us: 6_532,
+            wall_us: 117_204,
             accounting: "cgroup",
         }
     }
@@ -1011,7 +1035,9 @@ mod tests {
             result_full().to_json(),
             "{\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"killed\":null,\
              \"instructions\":1140561942,\"measurement\":\"full\",\"accounting\":\"cgroup\",\
-             \"cpu_ms\":116,\"wall_ms\":117,\"peak_kb\":5864}"
+             \"cpu_ms\":116,\"wall_ms\":117,\"peak_kb\":5864,\
+             \"cpu_us\":116532,\"cpu_user_us\":110000,\"cpu_sys_us\":6532,\
+             \"wall_us\":117204}"
         );
     }
 

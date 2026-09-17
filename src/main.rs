@@ -36,6 +36,8 @@ OPTIONS:
                          RLIMIT_CPU rides along as the backstop
     --mem-kb <N>         memory limit: cgroup memory.max at 1.25x (real RSS,
                          whole subtree), or RLIMIT_AS without a cgroup
+    --output-kb <N>      largest file the program may write, e.g. --stdout
+                         (RLIMIT_FSIZE; default 8192; over it: SIGXFSZ)
     --pin-cpu <N>        pin the run to CPU N (cgroup cpuset; kernel-enforced,
                          tree-wide). Give each concurrent worker its own core;
                          also tightens insn enforcement to 1-core burn rate
@@ -124,6 +126,12 @@ fn main() {
                         .parse()
                         .unwrap_or_else(|_| fail("--mem-kb not an integer")),
                 )
+            }
+            "--output-kb" => {
+                let kb: u64 = val("--output-kb")
+                    .parse()
+                    .unwrap_or_else(|_| fail("--output-kb not an integer"));
+                limits.max_output_bytes = kb.saturating_mul(1024);
             }
             "--pin-cpu" => {
                 limits.pin_cpu = Some(
