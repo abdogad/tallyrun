@@ -46,6 +46,8 @@ every option.
 | `cpu_us` | int | `cpu_ms` in microseconds (same source; `cpu_ms` is this divided by 1000, rounded down) |
 | `cpu_user_us` / `cpu_sys_us` | int | the user-mode / kernel-mode split of `cpu_us`. The total is exact scheduler runtime; the split is tick-sampled and scaled by the kernel to sum to it, so treat it as an estimate for short runs |
 | `wall_us` | int | `wall_ms` in microseconds |
+| `instructions_running` | float \| null | fraction of the run the instruction counter was actually on the PMU (time running / time enabled). Below 1.0 the kernel multiplexed it with other perf users and `instructions` is an undercount; judges should treat that run as unmeasured. `null` without perf |
+| `counters` | object, only with `--extra-counters` | user-space `l1d_read_misses`, `cache_misses` (the vendor's generic event: last-level on Intel, L2 on AMD Zen), `dtlb_read_misses`, `branch_misses`, each `{"count": int, "running": float}`. A counter the PMU does not offer is left out |
 
 ## Semantics a judge builds on
 

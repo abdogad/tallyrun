@@ -46,6 +46,8 @@ OPTIONS:
     --require-insn       exit 3 if perf can't count instructions, instead of
                          silently degrading to time-based measurement
     --require-cgroup     exit 3 without full cgroup accounting
+    --extra-counters     also count L1 data-cache misses, cache misses, dTLB
+                         misses and branch misses (JSON \"counters\")
     --no-isolate         run without bwrap (measurement only; trusted code)
     --no-seccomp         drop the seccomp syscall denylist that is otherwise
                          loaded into the sandbox (for debugging runtimes that
@@ -142,6 +144,7 @@ fn main() {
             }
             "--require-insn" => limits.require_insn = true,
             "--require-cgroup" => limits.require_cgroup = true,
+            "--extra-counters" => limits.extra_counters = true,
             "--no-isolate" => isolate = false,
             "--no-seccomp" => spec.seccomp = false,
             "--proc-bind" => spec.proc_mode = ProcMode::Bind,

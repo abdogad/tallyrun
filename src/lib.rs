@@ -75,6 +75,9 @@ pub struct Limits {
     pub require_insn: bool,
     /// Fail the run instead of degrading when no per-run cgroup is available.
     pub require_cgroup: bool,
+    /// Also count cache misses, TLB misses and branch mispredictions
+    /// ([`EXTRA_COUNTERS`]), for cost models beyond plain instructions.
+    pub extra_counters: bool,
 }
 
 impl Default for Limits {
@@ -90,6 +93,7 @@ impl Default for Limits {
             pin_cpu: None,
             require_insn: false,
             require_cgroup: false,
+            extra_counters: false,
         }
     }
 }
@@ -159,6 +163,15 @@ impl Default for SandboxSpec {
     }
 }
 
+/// One extra hardware counter's total over the process tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Counter {
+    pub name: &'static str,
+    pub count: u64,
+    /// time_running / time_enabled, as for `RunResult::instructions_running`.
+    pub running: f64,
+}
+
 /// Outcome of one measured execution.
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -181,6 +194,13 @@ pub struct RunResult {
     pub cpu_user_us: u64,
     pub cpu_sys_us: u64,
     pub wall_us: u128,
+    /// Fraction of the run the instruction counter was actually on the PMU
+    /// (time_running / time_enabled). Below 1.0 the kernel multiplexed it with
+    /// other perf users and `instructions` is an undercount.
+    pub instructions_running: Option<f64>,
+    /// Extra hardware counters, in [`EXTRA_COUNTERS`] order; only those the
+    /// PMU accepted. Empty unless `Limits::extra_counters`.
+    pub counters: Vec<Counter>,
     /// Where cpu_ms/peak_kb came from: "cgroup" (subtree-accurate), "cpu-only"
     /// (cgroup cpu, per-process rusage memory), or "rusage" (per-process only
     /// — multi-process runs are under-accounted).
@@ -206,11 +226,30 @@ impl RunResult {
         } else {
             "degraded"
         };
+        let running = self
+            .instructions_running
+            .map_or("null".to_string(), |r| format!("{r:.6}"));
+        let counters = if self.counters.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = self
+                .counters
+                .iter()
+                .map(|c| {
+                    format!(
+                        "\"{}\":{{\"count\":{},\"running\":{:.6}}}",
+                        c.name, c.count, c.running
+                    )
+                })
+                .collect();
+            format!(",\"counters\":{{{}}}", items.join(","))
+        };
         format!(
             "{{\"exit_code\":{},\"signal\":{},\"timed_out\":{},\"killed\":{},\
 \"instructions\":{},\"measurement\":\"{}\",\"accounting\":\"{}\",\
 \"cpu_ms\":{},\"wall_ms\":{},\"peak_kb\":{},\
-\"cpu_us\":{},\"cpu_user_us\":{},\"cpu_sys_us\":{},\"wall_us\":{}}}",
+\"cpu_us\":{},\"cpu_user_us\":{},\"cpu_sys_us\":{},\"wall_us\":{},\
+\"instructions_running\":{}{}}}",
             opt_i(self.exit_code),
             opt_i(self.signal),
             self.timed_out,
@@ -225,6 +264,8 @@ impl RunResult {
             self.cpu_user_us,
             self.cpu_sys_us,
             self.wall_us,
+            running,
+            counters,
         )
     }
 }
@@ -247,7 +288,42 @@ struct PerfEventAttr {
 }
 
 const PERF_TYPE_HARDWARE: u32 = 0;
+const PERF_TYPE_HW_CACHE: u32 = 3;
 const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
+const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
+// hw_cache config: cache id | (op << 8) | (result << 16)
+const HW_CACHE_L1D_READ_MISS: u64 = 1 << 16;
+const HW_CACHE_DTLB_READ_MISS: u64 = 3 | (1 << 16);
+const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+
+/// Counters `--extra-counters` adds, all user-space only like instructions.
+/// Four, so with instructions they fit a six-counter PMU that also serves the
+/// NMI watchdog without multiplexing. `cache_misses` is the vendor's generic
+/// cache-miss event: last-level on Intel, L2 on AMD Zen.
+pub const EXTRA_COUNTERS: [(&str, u32, u64); 4] = [
+    (
+        "l1d_read_misses",
+        PERF_TYPE_HW_CACHE,
+        HW_CACHE_L1D_READ_MISS,
+    ),
+    (
+        "cache_misses",
+        PERF_TYPE_HARDWARE,
+        PERF_COUNT_HW_CACHE_MISSES,
+    ),
+    (
+        "dtlb_read_misses",
+        PERF_TYPE_HW_CACHE,
+        HW_CACHE_DTLB_READ_MISS,
+    ),
+    (
+        "branch_misses",
+        PERF_TYPE_HARDWARE,
+        PERF_COUNT_HW_BRANCH_MISSES,
+    ),
+];
 const DISABLED: u64 = 1 << 0;
 const INHERIT: u64 = 1 << 1;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
@@ -319,6 +395,7 @@ fn perf_open_instructions(pid: libc::pid_t, kill_at: Option<u64>) -> io::Result<
             r#type: PERF_TYPE_HARDWARE,
             config: PERF_COUNT_HW_INSTRUCTIONS,
             flags: DISABLED | INHERIT | EXCLUDE_KERNEL | EXCLUDE_HV | ENABLE_ON_EXEC,
+            read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
             sample_period_or_freq: period,
             ..Default::default()
         };
@@ -363,10 +440,43 @@ fn perf_open_instructions(pid: libc::pid_t, kill_at: Option<u64>) -> io::Result<
     open(0)
 }
 
+/// A counting-only, user-space counter for `pid`'s subtree, enabled at exec.
+fn perf_open_counter(pid: libc::pid_t, r#type: u32, config: u64) -> Option<c_int> {
+    let attr = PerfEventAttr {
+        r#type,
+        size: std::mem::size_of::<PerfEventAttr>() as u32,
+        config,
+        flags: DISABLED | INHERIT | EXCLUDE_KERNEL | EXCLUDE_HV | ENABLE_ON_EXEC,
+        read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
+        ..Default::default()
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_perf_event_open,
+            &attr as *const PerfEventAttr as *const c_void,
+            pid,
+            -1i32,
+            -1i32,
+            0u64,
+        )
+    };
+    (fd >= 0).then_some(fd as c_int)
+}
+
+/// (count, time_enabled, time_running) of a counter opened with both
+/// PERF_FORMAT_TOTAL_TIME_* flags.
+fn read_counter_times(fd: c_int) -> Option<(u64, u64, u64)> {
+    let mut buf = [0u64; 3];
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, 24) };
+    (n == 24).then_some((buf[0], buf[1], buf[2]))
+}
+
 fn read_counter(fd: c_int) -> Option<u64> {
-    let mut count: u64 = 0;
-    let n = unsafe { libc::read(fd, &mut count as *mut u64 as *mut c_void, 8) };
-    (n == 8).then_some(count)
+    read_counter_times(fd).map(|(count, _, _)| count)
+}
+
+fn running_fraction(enabled: u64, running: u64) -> Option<f64> {
+    (enabled > 0).then(|| running as f64 / enabled as f64)
 }
 
 /// Can this environment mount a *fresh* procfs, the way bwrap `--proc` will?
@@ -845,6 +955,15 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
     };
 
+    // Extras need a working PMU; a counter this PMU doesn't offer is skipped.
+    let extra_fds: Vec<(&'static str, c_int)> = match perf_fd {
+        Some(_) if limits.extra_counters => EXTRA_COUNTERS
+            .iter()
+            .filter_map(|&(name, t, c)| perf_open_counter(pid, t, c).map(|fd| (name, fd)))
+            .collect(),
+        _ => Vec::new(),
+    };
+
     let start = Instant::now();
     let deadline = start + Duration::from_millis(limits.wall_ms);
     unsafe {
@@ -946,7 +1065,22 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     }
     let elapsed = start.elapsed();
 
-    let instructions = perf_fd.and_then(read_counter);
+    let insn_times = perf_fd.and_then(read_counter_times);
+    let instructions = insn_times.map(|(count, _, _)| count);
+    let instructions_running = insn_times.and_then(|(_, e, r)| running_fraction(e, r));
+    let counters: Vec<Counter> = extra_fds
+        .iter()
+        .filter_map(|&(name, fd)| {
+            let got = read_counter_times(fd);
+            unsafe { libc::close(fd) };
+            let (count, e, r) = got?;
+            Some(Counter {
+                name,
+                count,
+                running: running_fraction(e, r).unwrap_or(0.0),
+            })
+        })
+        .collect();
     if let Some(fd) = perf_fd {
         unsafe { libc::close(fd) };
     }
@@ -1003,6 +1137,8 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         cpu_user_us: cpu.user,
         cpu_sys_us: cpu.system,
         wall_us: elapsed.as_micros(),
+        instructions_running,
+        counters,
         accounting,
     })
 }
@@ -1025,6 +1161,8 @@ mod tests {
             cpu_user_us: 110_000,
             cpu_sys_us: 6_532,
             wall_us: 117_204,
+            instructions_running: Some(1.0),
+            counters: Vec::new(),
             accounting: "cgroup",
         }
     }
@@ -1037,14 +1175,41 @@ mod tests {
              \"instructions\":1140561942,\"measurement\":\"full\",\"accounting\":\"cgroup\",\
              \"cpu_ms\":116,\"wall_ms\":117,\"peak_kb\":5864,\
              \"cpu_us\":116532,\"cpu_user_us\":110000,\"cpu_sys_us\":6532,\
-             \"wall_us\":117204}"
+             \"wall_us\":117204,\"instructions_running\":1.000000}"
         );
+    }
+
+    #[test]
+    fn json_extra_counters() {
+        let r = RunResult {
+            instructions_running: Some(0.5),
+            counters: vec![
+                Counter {
+                    name: "cache_misses",
+                    count: 42,
+                    running: 1.0,
+                },
+                Counter {
+                    name: "branch_misses",
+                    count: 7,
+                    running: 0.25,
+                },
+            ],
+            ..result_full()
+        };
+        let j = r.to_json();
+        assert!(j.contains("\"instructions_running\":0.500000"));
+        assert!(j.ends_with(
+            ",\"counters\":{\"cache_misses\":{\"count\":42,\"running\":1.000000},\
+             \"branch_misses\":{\"count\":7,\"running\":0.250000}}}"
+        ));
     }
 
     #[test]
     fn json_degraded_when_no_instructions() {
         let r = RunResult {
             instructions: None,
+            instructions_running: None,
             accounting: "rusage",
             ..result_full()
         };
@@ -1052,6 +1217,8 @@ mod tests {
         assert!(j.contains("\"instructions\":null"));
         assert!(j.contains("\"measurement\":\"degraded\""));
         assert!(j.contains("\"accounting\":\"rusage\""));
+        assert!(j.contains("\"instructions_running\":null"));
+        assert!(!j.contains("counters"));
     }
 
     #[test]

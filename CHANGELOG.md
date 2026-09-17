@@ -12,6 +12,11 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
   Existing fields are unchanged.
 - `--output-kb <N>` sets the largest file the program may write
   (`RLIMIT_FSIZE`). The default stays 8 MiB.
+- `instructions_running`: the fraction of the run the instruction counter
+  was on the PMU. Below 1.0 means the kernel multiplexed it and the count is
+  low; before this, that undercount was silent.
+- `--extra-counters` adds user-space L1 data-cache, cache, dTLB and branch
+  miss counts (JSON `counters`), for cost models beyond instructions.
 
 ## [0.5.0] - 2026-07-06
 
