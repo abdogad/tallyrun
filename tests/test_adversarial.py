@@ -1,7 +1,7 @@
-"""Adversarial proofs: hostile behaviour is contained AND correctly measured,
-so the caller can map it to a verdict. Memory verdicts are decided on
-measured peak vs. the limit (the 1.25x memory.max headroom means an
-over-limit run is usually measured, not OOM-guessed)."""
+"""Hostile payloads. Each one has to be contained and still measured
+correctly, so the caller can turn the result into a verdict. Memory verdicts
+compare the measured peak to the limit; with memory.max at 1.25x the limit,
+an over-limit run is usually measured instead of inferred from an OOM kill."""
 
 import shutil
 
@@ -30,8 +30,8 @@ def test_output_flood_is_capped(tmp_path):
 
 
 def test_memory_bomb_is_stopped(tmp_path):
-    # A 2GB allocation against a 128MB limit: cgroup memory.max OOM-kills it
-    # (RLIMIT_AS in the fallback). Either way it never completes.
+    # 2GB against a 128MB limit. memory.max OOM-kills it, or RLIMIT_AS stops
+    # it when there's no cgroup.
     write_box(tmp_path, {"bomb.py":
         "held = []\n"
         "for _ in range(32):\n"
@@ -40,7 +40,7 @@ def test_memory_bomb_is_stopped(tmp_path):
     res = run_box(tmp_path, [PY, "bomb.py"], mem_kb=MEM_KB)
     assert "ALLOCATED" not in res["_stdout"]
     if HAVE_CG:
-        # Measured over-limit: this is the MLE signal a judge gates on.
+        # A measured peak over the limit is what a judge calls MLE.
         assert res["peak_kb"] > MEM_KB
     else:
         assert res["exit_code"] != 0
@@ -48,9 +48,9 @@ def test_memory_bomb_is_stopped(tmp_path):
 
 @needs_cgroup
 def test_fork_spread_memory_bomb_is_accounted(tmp_path):
-    # The hole per-process accounting can't see: 16 children x 64MB = 1GB
-    # total against a 128MB limit, no single process over ~64MB. memory.max
-    # caps the subtree total and memory.peak reports it.
+    # 16 children x 64MB = 1GB against a 128MB limit, with no single process
+    # over ~64MB, so per-process accounting would miss it. memory.max caps
+    # the total and memory.peak reports it.
     write_box(tmp_path, {"spread.py":
         "import os, time\n"
         "for _ in range(16):\n"
@@ -61,16 +61,15 @@ def test_fork_spread_memory_bomb_is_accounted(tmp_path):
         "time.sleep(3)\n"
         "print('SURVIVED')\n"})
     res = run_box(tmp_path, [PY, "spread.py"], mem_kb=MEM_KB, wall=8000)
-    assert res["peak_kb"] > MEM_KB  # subtree peak proves the MLE verdict
+    assert res["peak_kb"] > MEM_KB  # the tree's peak gives the MLE verdict
 
 
 @needs_cgroup
 def test_fork_spread_cpu_burn_is_killed(tmp_path):
-    # The CPU-side analogue of the fork-spread memory bomb: 8 children each
-    # burn ~0.5s of CPU — every one under the 1s per-process RLIMIT_CPU, but
-    # ~4s for the subtree against a 1s budget. Only the cgroup cpu.stat
-    # enforcement sees the aggregate; it must kill ("cpu") long before the
-    # wall timeout, which is the load-dependent bound this exists to replace.
+    # The CPU version of the test above: 8 children burn ~0.5s each. Each
+    # stays under the 1s RLIMIT_CPU, but together they use ~4s against a 1s
+    # budget. Only the cpu.stat check sees the total, and it has to kill the
+    # run ("cpu") well before the wall timeout, which depends on load.
     write_box(tmp_path, {"burn.py":
         "import os, time\n"
         "for _ in range(8):\n"
@@ -85,15 +84,14 @@ def test_fork_spread_cpu_burn_is_killed(tmp_path):
     res = run_box(tmp_path, [PY, "burn.py"], cpu_s=1, wall=20000)
     assert res["killed"] == "cpu"
     assert "SURVIVED" not in res["_stdout"]
-    assert res["wall_ms"] < 10000  # killed on CPU budget, nowhere near wall
+    assert res["wall_ms"] < 10000  # killed by the CPU budget, not the wall
 
 
 @needs_cgroup
 @needs_insn
 def test_fork_bomb_is_contained(tmp_path):
-    # perf inherit counts instructions across every forked child, so the bomb
-    # blows the instruction budget fast; cgroup.kill then reaps the whole
-    # subtree atomically. Wall stays far under the timeout.
+    # The inherited counter includes every forked child, so the bomb runs
+    # through its instruction budget fast and cgroup.kill removes the tree.
     write_box(tmp_path, {"fork.py":
         "import os\n"
         "while True:\n"
@@ -102,10 +100,9 @@ def test_fork_bomb_is_contained(tmp_path):
         "    except OSError:\n"
         "        pass\n"})
     res = run_box(tmp_path, [PY, "fork.py"], insn=500_000_000, wall=4000)
-    # Containment has three possible faces, all fine: the instruction budget
-    # fires, the wall fires, or the cgroup OOM killer takes out the
-    # namespace init as thousands of spinners hit memory.max. What must never
-    # happen: a clean exit, or outliving the wall timeout.
+    # Any of these kills is fine: the instruction budget, the wall timeout, or
+    # the OOM killer taking out the namespace init once thousands of
+    # processes hit memory.max. A clean exit or outliving the wall is not.
     assert res["killed"] is not None or res["exit_code"] != 0
     assert res["wall_ms"] <= 4500
 

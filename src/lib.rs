@@ -1,31 +1,29 @@
-//! tallyrun core — run one command isolated (bubblewrap), measure its work as a
-//! load-independent instruction count (perf), enforce limits, report a
-//! structured result.
+//! Runs one command inside bubblewrap, counts the user-space instructions it
+//! retires, enforces its limits and returns a [`RunResult`].
 //!
-//! Boundary: this engine runs ONE command. Everything above it — compile steps,
-//! test tiers, checkers, verdict mapping (AC/WA/TLE/...) — belongs to the caller
-//! (a judge, autograder, or execution backend). tallyrun knows nothing about
-//! problems or queues.
+//! The crate handles a single command. Compile steps, test cases, checkers
+//! and verdicts (AC/WA/TLE...) belong to the caller.
 //!
-//! Isolation reuses bubblewrap: a fresh net/pid/user/ipc/mount namespace,
-//! /usr read-only, the work box at /box.
-//! Measurement: a `perf_event_open` counter for retired user-space instructions
-//! is attached to the bwrap child with `inherit=1`, so it follows the whole
-//! subtree across bwrap's new PID namespace. Peak RSS and CPU time come from a
-//! per-run cgroup v2 (memory.peak / cpu.stat) with memory.max + swap.max=0
-//! caps and atomic cgroup.kill teardown; wait4 rusage is the fallback when no
-//! cgroup is available (per-process only — the JSON `accounting` field says
-//! which one you got).
-//! Supervision is event-driven, no polling: the parent sleeps in poll(2) on a
-//! pidfd with the wall deadline as timeout, and the instruction limit is a
-//! PMU tripwire — overflow at the budget SIGKILLs the run in-kernel. The CPU
-//! budget (`cpu_seconds`) is enforced subtree-wide from cgroup cpu.stat: it
-//! bounds the kernel-mode and fork-spread work the instruction counter
-//! cannot see, without depending on wall-clock load.
+//! Isolation is bubblewrap with fresh namespaces, a read-only /usr and the
+//! work dir at /box. The instruction counter is a perf event opened on the
+//! bwrap child with `inherit=1`, so it keeps counting across bwrap's PID
+//! namespace and every process the payload forks. CPU time and peak RSS come
+//! from a per-run cgroup v2 (cpu.stat, memory.peak), which also provides the
+//! memory cap and `cgroup.kill`. Without a cgroup they fall back to wait4
+//! rusage, which sees a single process; the JSON `accounting` field says
+//! which source was used.
 //!
-//! Note: because we count from the bwrap child's exec, a small, roughly-constant
-//! bwrap-setup offset is included in `instructions`. It is stable run-to-run and
-//! cancels in limit comparisons; removing it entirely wants native namespaces.
+//! The supervisor sleeps in poll(2) on a pidfd, with the wall deadline as the
+//! timeout. The PMU enforces the instruction limit itself: the counter
+//! overflows at the budget and the kernel SIGKILLs the process group. The CPU
+//! budget is checked against cpu.stat for the whole tree. That catches
+//! kernel-mode work, which the instruction counter leaves out, and work
+//! spread over short-lived processes, which never adds up under a
+//! per-process RLIMIT_CPU.
+//!
+//! Counting starts at the bwrap child's exec, so `instructions` includes
+//! bwrap's own setup. That offset is small and stable from run to run.
+//! Removing it would take native namespaces instead of bwrap.
 
 pub mod cgroup;
 pub mod seccomp;
@@ -40,43 +38,44 @@ use std::time::{Duration, Instant};
 
 pub const BWRAP: &str = "/usr/bin/bwrap";
 
-/// memory.max headroom over the caller's limit: a run between 1.0x and 1.25x
-/// is measured (and correctly flagged over-limit by the caller comparing
-/// peak_kb to its limit) instead of OOM-killed at the boundary.
+/// memory.max is 1.25x the caller's limit. A run that peaks between 1.0x and
+/// 1.25x gets measured instead of OOM-killed, and the caller still sees
+/// peak_kb over its limit.
 const MEM_CAP_NUM: u64 = 5;
 const MEM_CAP_DEN: u64 = 4;
 
 /// Resource limits and the instruction budget for one run.
 #[derive(Debug, Clone)]
 pub struct Limits {
-    /// Wall-clock safety timeout — only catches hangs that burn no instructions.
+    /// Wall-clock timeout, for hangs that burn no instructions.
     pub wall_ms: u64,
-    /// Kill once retired instructions exceed this (the load-invariant TLE path).
+    /// Kill once retired instructions exceed this. Unlike CPU time, the count
+    /// doesn't depend on machine load.
     pub insn_limit: Option<u64>,
-    /// CPU-time budget in seconds. With a cgroup this is enforced on the
-    /// whole subtree (cpu.stat, `killed:"cpu"`) — the bound that catches
-    /// multi-process or syscall-heavy work the instruction counter can't see
-    /// (kernel mode is excluded by design). Per-process RLIMIT_CPU is set
-    /// alongside as a backstop and is the only bound without a cgroup.
+    /// CPU budget in seconds. With a cgroup it covers the whole tree
+    /// (cpu.stat, reported as `killed:"cpu"`), so it also catches kernel-mode
+    /// work, which the instruction counter leaves out. RLIMIT_CPU is set on
+    /// each process as well, and is the only CPU limit without a cgroup.
     pub cpu_seconds: u64,
-    /// Memory limit (the MLE verdict threshold). With a cgroup this becomes
-    /// memory.max at 1.25x (subtree-wide, real RSS); without one it falls
-    /// back to per-process RLIMIT_AS at 1.0x.
+    /// Memory limit in KiB (the MLE threshold). With a cgroup it becomes
+    /// memory.max at 1.25x, on real RSS for the whole tree. Without one it is
+    /// RLIMIT_AS at 1.0x on each process.
     pub mem_kb: Option<u64>,
     pub max_procs: u64,
     pub max_output_bytes: u64,
     pub max_open_files: u64,
-    /// Pin the run to one CPU (cgroup cpuset — kernel-enforced, tree-wide).
-    /// Serializes multi-threaded payloads; tightens the insn backstop
-    /// to single-core burn rate. Assign each concurrent worker its own core.
+    /// Pin the whole run to one CPU with the cgroup cpuset, which the payload
+    /// can't undo. Threads then share that core, and the instruction backstop
+    /// can assume one core's burn rate. Give each concurrent worker its own
+    /// CPU.
     pub pin_cpu: Option<u32>,
-    /// Fail the run instead of degrading when perf can't count instructions.
-    /// Judges should set this: a degraded run can't produce a fair verdict.
+    /// Fail instead of degrading when perf can't count instructions. Judges
+    /// should set this, since a degraded run can't give a fair verdict.
     pub require_insn: bool,
-    /// Fail the run instead of degrading when no per-run cgroup is available.
+    /// Fail instead of degrading when no per-run cgroup is available.
     pub require_cgroup: bool,
     /// Also count cache misses, TLB misses and branch mispredictions
-    /// ([`EXTRA_COUNTERS`]), for cost models beyond plain instructions.
+    /// ([`EXTRA_COUNTERS`]), for cost models that need more than instructions.
     pub extra_counters: bool,
 }
 
@@ -87,7 +86,7 @@ impl Default for Limits {
             insn_limit: None,
             cpu_seconds: 10,
             mem_kb: None,
-            max_procs: 4096, // NPROC is per-uid; tight values break bwrap's clone()
+            max_procs: 4096, // RLIMIT_NPROC counts per uid; a tight value breaks bwrap's clone()
             max_output_bytes: 8 * 1024 * 1024,
             max_open_files: 64,
             pin_cpu: None,
@@ -98,47 +97,43 @@ impl Default for Limits {
     }
 }
 
-/// How `/proc` is presented inside the sandbox.
+/// How `/proc` appears inside the sandbox.
 ///
-/// A bind of the host `/proc` leaks every host PID (and its cmdline) into the
-/// sandbox even though the process is in its own PID namespace, because
-/// procfs shows the tasks of the namespace the *mount* was created in. A
-/// fresh procfs (bwrap `--proc`) shows only the sandbox's own tree — the
-/// correct isolation — but the kernel refuses to mount one when the existing
-/// `/proc` has locked child mounts (the masked `/proc/*` a hardened container
-/// runtime like Docker adds), the `mount_too_revealing` check.
+/// procfs lists the tasks of the PID namespace it was mounted in, so binding
+/// the host `/proc` shows every host PID and command line to the sandbox,
+/// even though the sandbox has its own PID namespace. A fresh procfs (bwrap
+/// `--proc`) shows only the sandbox's tree. The kernel refuses to mount one
+/// when the existing `/proc` has locked submounts, such as the masked
+/// `/proc/*` paths Docker adds (the `mount_too_revealing` check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcMode {
-    /// Probe for a fresh procfs and use it; fall back to a read-only bind
-    /// (with a warning) where the kernel forbids it. The right default:
-    /// secure on bare metal / VMs, still works in hardened containers.
+    /// Mount a fresh procfs if a probe says the kernel allows it; otherwise
+    /// bind the host `/proc` read-only and print a warning. Host PIDs stay
+    /// hidden on bare metal and VMs, and hardened containers still work.
     #[default]
     Auto,
-    /// Always mount a fresh procfs (`--proc`). bwrap fails loudly if the
-    /// environment forbids it.
+    /// Always mount a fresh procfs. bwrap fails if the kernel refuses.
     Fresh,
-    /// Always bind the host `/proc` read-only. Skips the probe; use when you
-    /// know you are in a masked-procfs container and accept the PID leak.
+    /// Always bind the host `/proc` read-only and skip the probe. For
+    /// masked-procfs containers, at the cost of showing host PIDs.
     Bind,
 }
 
-/// How the sandbox is wired: the work box, whether it's writable (compile step),
-/// and where the three standard streams come from / go.
+/// The sandbox layout and where the payload's standard streams point.
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
-    /// Work dir bind-mounted at /box. `None` disables bwrap (direct exec) — for
-    /// measuring on a host without bwrap, not for untrusted code.
+    /// Work dir, mounted at /box. `None` skips bwrap and runs the command
+    /// directly on the host, which is only for trusted code.
     pub box_dir: Option<PathBuf>,
     pub writable: bool,
-    /// Extra mounts layered on the base /usr view: (src, dst, writable).
+    /// Extra mounts as (src, dst, writable).
     pub extra_binds: Vec<(String, String, bool)>,
-    /// Prepared cgroup dir for per-run children (overrides TALLYRUN_CGROUP_DIR
-    /// and the self-service vacate dance).
+    /// A prepared cgroup directory to create run cgroups in. Takes precedence
+    /// over TALLYRUN_CGROUP_DIR and the automatic setup in [`cgroup::setup`].
     pub cgroup_dir: Option<PathBuf>,
-    /// Load the seccomp denylist (src/seccomp.rs) into the sandbox. Default
-    /// true; only rides on bwrap, so `--no-isolate` runs never get a filter.
+    /// Load the [`seccomp`] denylist. bwrap installs it, so runs without a
+    /// box never get a filter.
     pub seccomp: bool,
-    /// How `/proc` is exposed to the sandbox. See [`ProcMode`].
     pub proc_mode: ProcMode,
     pub stdin: PathBuf,
     pub stdout: PathBuf,
@@ -155,8 +150,8 @@ impl Default for SandboxSpec {
             seccomp: true,
             proc_mode: ProcMode::default(),
             stdin: PathBuf::from("/dev/null"),
-            // Discarded, not inherited: tallyrun's own stdout carries the JSON
-            // result, and the payload may not write to it.
+            // tallyrun's own stdout carries the JSON result, so the payload's
+            // output is discarded unless the caller names a file.
             stdout: PathBuf::from("/dev/null"),
             stderr: PathBuf::from("/dev/stderr"),
         }
@@ -177,38 +172,39 @@ pub struct Counter {
 pub struct RunResult {
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
-    /// The wall-clock safety timeout fired (a genuine hang).
+    /// The wall-clock timeout fired.
     pub timed_out: bool,
     /// Why tallyrun killed the process, if it did:
     /// "instructions" | "cpu" | "wall".
     pub killed: Option<&'static str>,
-    /// Retired user-space instructions — low-variance, load-invariant virtual
-    /// time. `None` if perf couldn't open (paranoid setting / no PMU).
+    /// Retired user-space instructions for the whole tree. `None` if perf
+    /// couldn't open a counter (perf_event_paranoid too high, or no PMU).
     pub instructions: Option<u64>,
     pub cpu_ms: u64,
     pub wall_ms: u128,
     pub peak_kb: i64,
-    /// Microsecond forms of `cpu_ms` (with its user/system split) and
-    /// `wall_ms`: 1 ms truncation alone is ±5% on a 20 ms run.
+    /// Microsecond versions of `cpu_ms` (plus its user/system split) and
+    /// `wall_ms`. Truncating to 1 ms is already a 5% error on a 20 ms run.
     pub cpu_us: u64,
     pub cpu_user_us: u64,
     pub cpu_sys_us: u64,
     pub wall_us: u128,
-    /// Fraction of the run the instruction counter was actually on the PMU
-    /// (time_running / time_enabled). Below 1.0 the kernel multiplexed it with
-    /// other perf users and `instructions` is an undercount.
+    /// Fraction of the run the instruction counter was on the PMU
+    /// (time_running / time_enabled). Below 1.0 the kernel was sharing the
+    /// PMU with other perf users and `instructions` is too low.
     pub instructions_running: Option<f64>,
     /// Extra hardware counters, in [`EXTRA_COUNTERS`] order; only those the
     /// PMU accepted. Empty unless `Limits::extra_counters`.
     pub counters: Vec<Counter>,
-    /// Where cpu_ms/peak_kb came from: "cgroup" (subtree-accurate), "cpu-only"
-    /// (cgroup cpu, per-process rusage memory), or "rusage" (per-process only
-    /// — multi-process runs are under-accounted).
+    /// Where cpu_ms/peak_kb came from: "cgroup" (whole tree), "cpu-only"
+    /// (cgroup CPU, rusage memory), or "rusage" (one process, so multi-process
+    /// runs are under-counted).
     pub accounting: &'static str,
 }
 
 impl RunResult {
-    /// Stable JSON line — the CLI contract callers parse (docs/CONTRACT.md).
+    /// The JSON line the CLI prints. Its fields are a stable contract
+    /// (docs/CONTRACT.md).
     pub fn to_json(&self) -> String {
         fn opt_i(v: Option<i32>) -> String {
             v.map_or("null".into(), |x| x.to_string())
@@ -219,8 +215,8 @@ impl RunResult {
         let killed = self
             .killed
             .map_or("null".to_string(), |s| format!("\"{s}\""));
-        // "degraded" shouts what a null `instructions` only whispers: no perf,
-        // so any verdict from this run is time-based and load-dependent.
+        // Redundant with a null `instructions`, but harder to overlook: without
+        // perf, any verdict from this run rests on load-dependent time.
         let measurement = if self.instructions.is_some() {
             "full"
         } else {
@@ -270,7 +266,7 @@ impl RunResult {
     }
 }
 
-// --- perf_event_attr, hand-rolled (VER1 layout, 72 bytes) -------------------
+/// perf_event_attr, written out up to config2 (the 72-byte VER1 layout).
 #[repr(C)]
 #[derive(Default)]
 struct PerfEventAttr {
@@ -298,10 +294,10 @@ const HW_CACHE_DTLB_READ_MISS: u64 = 3 | (1 << 16);
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 
-/// Counters `--extra-counters` adds, all user-space only like instructions.
-/// Four, so with instructions they fit a six-counter PMU that also serves the
-/// NMI watchdog without multiplexing. `cache_misses` is the vendor's generic
-/// cache-miss event: last-level on Intel, L2 on AMD Zen.
+/// The counters `--extra-counters` adds, user space only like instructions.
+/// There are four so that, with instructions and the NMI watchdog, they fit a
+/// six-counter PMU without multiplexing. `cache_misses` is the vendor's
+/// generic event: last-level cache on Intel, L2 on AMD Zen.
 pub const EXTRA_COUNTERS: [(&str, u32, u64); 4] = [
     (
         "l1d_read_misses",
@@ -331,7 +327,7 @@ const EXCLUDE_HV: u64 = 1 << 6;
 const ENABLE_ON_EXEC: u64 = 1 << 12;
 const PERF_SAMPLE_IP: u64 = 1;
 
-// fcntl owner ABI (asm-generic); the libc crate doesn't export these.
+// fcntl owner constants from asm-generic; the libc crate doesn't export them.
 const F_SETSIG: c_int = 10;
 const F_SETOWN_EX: c_int = 15;
 const F_OWNER_PGRP: c_int = 2;
@@ -347,27 +343,25 @@ const NO_PIDFD_TICK: Duration = Duration::from_millis(5);
 /// Minimum backstop sleep; caps the re-check rate near the limit.
 const BACKSTOP_FLOOR: Duration = Duration::from_millis(1);
 
-/// Per-core retirement ceiling for backstop sizing. Must bound the *fastest*
-/// workload class, not a typical one: a high-ILP compiled loop on a 2026
-/// desktop core (~6 GHz, IPC 5–6) retires ~30–35G/s, where an interpreter
-/// loop measures only ~14G/s — sizing to the latter would let a compiled,
-/// forking payload overshoot between backstop reads on exactly the fast
-/// hardware a judge wants. 40G/s adds headroom; the cost of over-estimating
-/// is only more frequent poll timeouts near the budget.
+/// The most instructions one core can retire per second, used to size the
+/// backstop sleep. It has to cover the fastest code: a high-ILP compiled loop
+/// on a 2026 desktop core (~6 GHz, IPC 5-6) retires 30-35G/s, against ~14G/s
+/// for an interpreter loop. Sized for the interpreter, a forking compiled
+/// payload could overshoot between reads on fast machines. Setting it too
+/// high only costs extra wakeups near the budget.
 const PEAK_INSN_RATE_PER_CORE: u64 = 40_000_000_000;
 
-/// Longest sleep such that even every core at peak rate could not burn the
-/// remaining budget before the next aggregate read — forking can't outrun it.
+/// The longest sleep in which every core at peak rate still couldn't burn
+/// the remaining budget, so forking can't outrun the next read.
 fn backstop_timeout(remaining_insns: u64, cores: u64) -> Duration {
     let rate = cores.max(1).saturating_mul(PEAK_INSN_RATE_PER_CORE);
     let ns = remaining_insns as u128 * 1_000_000_000 / rate as u128;
     Duration::from_nanos(ns.min(u64::MAX as u128) as u64).max(BACKSTOP_FLOOR)
 }
 
-/// Same idea for the subtree CPU budget: CPU time accrues at most `cores`
-/// CPU-ms per wall-ms, so sleeping `remaining / cores` guarantees the next
-/// cpu.stat read happens before the budget can be exceeded by more than a
-/// few core-milliseconds.
+/// The same for the CPU budget: the tree uses at most `cores` ms of CPU per
+/// ms of wall time, so after sleeping `remaining / cores` the next cpu.stat
+/// read can find the budget exceeded by a few core-milliseconds at most.
 fn cpu_backstop_timeout(remaining_ms: u64, cores: u64) -> Duration {
     Duration::from_millis(remaining_ms / cores.max(1)).max(BACKSTOP_FLOOR)
 }
@@ -378,17 +372,17 @@ fn pidfd_open(pid: libc::pid_t) -> Option<c_int> {
     (fd >= 0).then_some(fd as c_int)
 }
 
-/// Open a retired-instruction counter for `pid`'s subtree (inherit=1, enabled
-/// at exec). With `kill_at`, the counter is also a tripwire: PMU overflow at
-/// the budget SIGKILLs the run's process group in-kernel — the same
-/// sample_period + fasync mechanism sio2jail uses, delivering SIGKILL
-/// directly instead of SIGIO to a supervisor handler. read() stays the
-/// aggregate tree count.
+/// Open a retired-instruction counter on `pid` and its descendants
+/// (inherit=1), enabled at exec. With `kill_at`, overflowing the budget makes
+/// the kernel SIGKILL the run's process group. sio2jail uses the same
+/// sample_period + fasync setup, but gets a SIGIO in its supervisor instead.
+/// read() still returns the total for the whole tree.
 ///
-/// The period is per-task, so a forking payload can exceed the aggregate
-/// budget untripped, and a setsid() escapee leaves the signalled group; the
-/// backstop read covers both. poll() can't replace the signal: the kernel
-/// forbids the ring-buffer mmap on inherited task events.
+/// The sample period counts per task, so forked children can exceed the
+/// budget together without any one of them tripping it, and a child that
+/// calls setsid() leaves the signalled group. The backstop read catches both.
+/// poll() can't stand in for the signal because the kernel won't mmap a ring
+/// buffer for an inherited event.
 fn perf_open_instructions(pid: libc::pid_t, kill_at: Option<u64>) -> io::Result<c_int> {
     let open = |period: u64| -> io::Result<c_int> {
         let mut attr = PerfEventAttr {
@@ -421,7 +415,7 @@ fn perf_open_instructions(pid: libc::pid_t, kill_at: Option<u64>) -> io::Result<
     };
     if let Some(limit) = kill_at.filter(|&l| l > 0) {
         if let Ok(fd) = open(limit) {
-            // Best-effort: if refused, the backstop still enforces.
+            // If fcntl fails, the backstop read still enforces the limit.
             unsafe {
                 let own = FOwnerEx {
                     r#type: F_OWNER_PGRP,
@@ -479,32 +473,30 @@ fn running_fraction(enabled: u64, running: u64) -> Option<f64> {
     (enabled > 0).then(|| running as f64 / enabled as f64)
 }
 
-/// Can this environment mount a *fresh* procfs, the way bwrap `--proc` will?
+/// Whether a fresh procfs can be mounted here, the way bwrap `--proc` does.
 ///
-/// True on bare metal and clean namespaces; false inside a hardened container
-/// whose `/proc` has locked masking mounts (the kernel's
-/// `mount_too_revealing` check refuses a new, less-restricted procfs). We
-/// can't read this reliably from `/proc/self/mountinfo` — whether a submount
-/// is *locked* isn't exposed there — so we probe it directly, exactly the way
-/// bwrap does: in a throwaway child, enter a new user + PID + mount namespace
-/// (unshare(CLONE_NEWUSER) grants full caps there; a PID namespace is
-/// required to mount procfs), then attempt the mount. The child tree exits
-/// immediately and is reaped here, so nothing leaks into the real run.
+/// A hardened container whose `/proc` has locked masking mounts refuses it
+/// (the kernel's `mount_too_revealing` check). mountinfo doesn't show which
+/// submounts are locked, so this tries the mount the way bwrap would: a
+/// throwaway child unshares a user namespace (for the capabilities), a PID
+/// namespace (procfs needs one) and a mount namespace, then forks a process
+/// into the new PID namespace to attempt the mount. Both exit right away and
+/// are reaped here.
 fn fresh_proc_available() -> bool {
     match unsafe { libc::fork() } {
-        -1 => false, // can't probe → caller falls back to the always-safe bind
+        -1 => false, // can't probe, so fall back to the bind
         0 => {
-            // child: async-signal-safe syscalls only, then _exit.
+            // Child: async-signal-safe calls only, then _exit.
             let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID;
             if unsafe { libc::unshare(flags) } != 0 {
-                unsafe { libc::_exit(2) }; // no unpriv userns → bwrap won't run either
+                unsafe { libc::_exit(2) }; // no unprivileged userns, so bwrap can't run either
             }
-            // The proc mount must be done from *inside* the new PID namespace,
-            // which only children entered by the CLONE_NEWPID unshare are.
+            // unshare(CLONE_NEWPID) only moves later children into the new
+            // namespace, and the mount has to happen from inside it.
             match unsafe { libc::fork() } {
                 -1 => unsafe { libc::_exit(2) },
                 0 => unsafe {
-                    // Don't let our probe mount propagate back to the host.
+                    // Keep the probe mount from propagating to the host.
                     libc::mount(
                         c"none".as_ptr(),
                         c"/".as_ptr(),
@@ -541,12 +533,11 @@ fn fresh_proc_available() -> bool {
     }
 }
 
-/// Build the full argv to exec: bwrap-wrapped when a box is given, else raw.
-/// `seccomp_fd` is a memfd holding the compiled filter, inherited across the
-/// exec for bwrap's `--seccomp FD` (loaded last, so it never constrains
-/// bwrap's own sandbox setup — only the payload subtree). `fresh_proc` picks
-/// between a fresh procfs (`--proc`, hides host PIDs) and a read-only bind of
-/// the host `/proc` (leaks them, but always mountable) — see [`ProcMode`].
+/// The argv to exec: wrapped in bwrap when there is a box, unchanged
+/// otherwise. `seccomp_fd` is a memfd with the compiled filter, passed as
+/// `--seccomp FD`. bwrap installs it last, so it applies to the payload and
+/// not to bwrap's own setup. `fresh_proc` chooses between `--proc` and a
+/// read-only bind of the host `/proc` (see [`ProcMode`]).
 #[rustfmt::skip] // the bwrap argv reads as a table of (flag, args) rows
 fn build_command(
     argv: &[String],
@@ -595,9 +586,9 @@ fn build_command(
             "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
             "--setenv", "HOME", "/tmp",
             "--setenv", "PYTHONPYCACHEPREFIX", "/tmp/pycache",
-            // Hash randomization dominates Python's run-to-run instruction
-            // variance (docs/BENCHMARK.md, Result 4) — pinning it trades
-            // hash-DoS hardening for measurement fairness, like fixed-seed judges.
+            // Hash randomization is the largest source of run-to-run
+            // instruction variance in Python (docs/BENCHMARK.md, Result 4).
+            // Pinning it gives up hash-DoS protection, as fixed-seed judges do.
             "--setenv", "PYTHONHASHSEED", "0",
             "--setenv", "TMPDIR", "/tmp",
             "--",
@@ -609,10 +600,10 @@ fn build_command(
     cmd
 }
 
-/// Resolve a stream path to a raw fd. For `/dev/std{in,out,err}` we inherit the
-/// existing fd (0/1/2) rather than open the path: opening those with O_TRUNC
-/// would truncate whatever the caller redirected them to (its own log). The
-/// bool is `owned` — whether the parent must close it afterwards.
+/// Open a stream path, returning the fd and whether the parent must close it.
+/// `/dev/stdin`, `/dev/stdout` and `/dev/stderr` reuse fd 0/1/2 instead of
+/// being opened, since O_TRUNC would truncate whatever file the caller
+/// redirected that stream to.
 fn resolve_fd(path: &Path, std_fd: RawFd, write: bool) -> io::Result<(RawFd, bool)> {
     let s = path.to_string_lossy();
     let std_path = match std_fd {
@@ -622,15 +613,15 @@ fn resolve_fd(path: &Path, std_fd: RawFd, write: bool) -> io::Result<(RawFd, boo
         _ => "",
     };
     if s == std_path {
-        return Ok((std_fd, false)); // inherit; do not O_TRUNC, do not close
+        return Ok((std_fd, false));
     }
     let c = CString::new(s.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    // O_NOFOLLOW: these paths usually live in the box, which the payload of a
-    // previous run (a --writable compile step) can write to. A symlink planted
-    // there would aim this open — done by the parent, outside the namespaces,
-    // as the host user — at any file that user can reach, truncating it on the
-    // write path and feeding it to the payload's stdin on the read path.
+    // O_NOFOLLOW because these paths are usually in the box, where an earlier
+    // --writable run (a compile step) could have left a symlink. This open
+    // runs on the host as the calling user, so following the link would
+    // truncate any file that user can write, or feed any file it can read to
+    // the payload's stdin.
     let (flags, mode) = if write {
         (
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
@@ -657,20 +648,18 @@ fn resolve_fd(path: &Path, std_fd: RawFd, write: bool) -> io::Result<(RawFd, boo
     Ok((fd, true))
 }
 
-/// Close every descriptor above stderr except `keep`, immediately before exec.
+/// Close every fd above 2 except `keep` (the seccomp memfd bwrap reads, or
+/// -1), right before exec.
 ///
-/// Whatever the caller had open at fork — a log file, a database socket, a
-/// directory handle — is otherwise inherited straight into the sandboxed
-/// payload, and bwrap does not close it either. An inherited *directory* fd is
-/// a plain escape: `openat()` resolves relative to it, walking outside the
-/// mount namespace to read or write anywhere that fd's owner can reach.
-/// `keep` is the seccomp memfd, which bwrap reads by number (-1 for none).
+/// bwrap doesn't close inherited fds, so anything the caller had open at fork
+/// would reach the payload. A directory fd is enough to escape: openat()
+/// relative to it resolves outside the sandbox's mount namespace.
 ///
-/// async-signal-safe: raw syscalls only, no allocation.
+/// Async-signal-safe: raw syscalls, no allocation.
 unsafe fn close_inherited_fds(keep: c_int, ceiling: c_int) {
     let range = |lo: u32, hi: u32| -> bool {
-        // An empty range is nothing to do, not a failure; close_range would
-        // reject lo > hi with EINVAL.
+        // close_range rejects lo > hi with EINVAL; an empty range just means
+        // there is nothing to close.
         lo > hi || libc::syscall(libc::SYS_close_range, lo, hi, 0u32) == 0
     };
     let closed = if keep > 2 {
@@ -682,7 +671,7 @@ unsafe fn close_inherited_fds(keep: c_int, ceiling: c_int) {
     if closed {
         return;
     }
-    // No close_range (pre-5.9): walk the range the caller could have opened.
+    // No close_range before Linux 5.9: close each fd up to the caller's limit.
     for fd in 3..=ceiling {
         if fd != keep {
             libc::close(fd);
@@ -704,11 +693,10 @@ fn set_rlimit(res: c_int, soft: u64, hard: u64) {
 /// Run `argv[0]` with the given isolation and limits, measuring its work.
 pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<RunResult> {
     assert!(!argv.is_empty(), "argv must contain at least the program");
-    // The payload must never share the stream tallyrun prints its JSON on: a
-    // line it writes there is indistinguishable from the result contract.
-    // `/dev/stdout` is the one path that reaches resolve_fd's inherit case for
-    // fd 1; the `/dev/fd/1` and `/proc/self/fd/1` spellings are symlinks and
-    // O_NOFOLLOW already refuses them.
+    // The JSON result goes to tallyrun's stdout, and a line the payload wrote
+    // there could pass for it. Only the literal `/dev/stdout` needs checking:
+    // other spellings such as `/dev/fd/1` are symlinks, which O_NOFOLLOW
+    // already refuses.
     for p in [&spec.stdout, &spec.stderr] {
         if p.as_os_str() == "/dev/stdout" {
             return Err(io::Error::new(
@@ -718,13 +706,12 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
             ));
         }
     }
-    // The filter memfd rides into the child's exec (bwrap reads it by fd
-    // number); OwnedFd closes the parent's copy on every path after fork.
+    // The child inherits the filter memfd through exec for bwrap to read.
+    // OwnedFd closes the parent's copy on every return path.
     let seccomp_fd: Option<OwnedFd> = match (&spec.box_dir, spec.seccomp) {
         (Some(_), true) => Some(seccomp::install_fd()?),
         _ => None,
     };
-    // Resolve how /proc is presented (only relevant when bwrap is in play).
     let fresh_proc = spec.box_dir.is_some()
         && match spec.proc_mode {
             ProcMode::Fresh => true,
@@ -749,8 +736,6 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         fresh_proc,
     );
 
-    // Per-run cgroup: subtree-wide CPU/RSS accounting, a real memory cap, and
-    // atomic kill. Degrades loudly to per-process rusage + RLIMIT_AS.
     let mut cg = match cgroup::setup(spec.cgroup_dir.as_deref())
         .and_then(|base| cgroup::RunCgroup::create(&base))
     {
@@ -775,7 +760,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
         c.set_pids_max(limits.max_procs);
     }
-    // Only a *confirmed* pin lets the backstop assume single-core burn rate.
+    // The backstop may assume a single core only if the pin took effect.
     let pinned = match (limits.pin_cpu, &cg) {
         (Some(cpu), Some(c)) => match c.set_cpus(cpu) {
             Ok(()) => true,
@@ -793,9 +778,9 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
         _ => false,
     };
-    // Cap and peak are probed separately: on 5.9–5.18 kernels memory.max
-    // exists but memory.peak doesn't, and the cap alone must still suppress
-    // the RLIMIT_AS fallback (see has_memory_cap).
+    // Checked separately: 5.9-5.18 kernels have memory.max but no
+    // memory.peak, and the cap alone is enough to skip RLIMIT_AS (see
+    // has_memory_cap).
     let cg_mem_cap = cg.as_ref().is_some_and(|c| c.has_memory_cap());
     let cg_mem_peak = cg.as_ref().is_some_and(|c| c.has_memory_peak());
     if limits.require_cgroup && !cg_mem_peak {
@@ -806,7 +791,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         ));
     }
 
-    // Marshal C argv before fork (no allocation after fork).
+    // Build the C argv now; the child can't allocate after fork.
     let c_args: Vec<CString> = cmd
         .iter()
         .map(|a| CString::new(a.as_bytes()))
@@ -815,7 +800,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     let mut c_argv: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
     c_argv.push(std::ptr::null());
 
-    // Resolve the three streams in the parent so failures surface before fork.
+    // Open the streams in the parent so errors show up before fork.
     let (fd_in, own_in) = resolve_fd(&spec.stdin, 0, false)?;
     let (fd_out, own_out) = resolve_fd(&spec.stdout, 1, true)?;
     let (fd_err, own_err) = resolve_fd(&spec.stderr, 2, true)?;
@@ -826,18 +811,16 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     }
     let (sync_r, sync_w) = (sync[0], sync[1]);
 
-    // Snapshot limits for the child (no struct access across fork).
     let cpu_seconds = limits.cpu_seconds;
-    // RLIMIT_AS (virtual address space) wildly over-counts real RSS; when the
-    // cgroup caps real RSS we drop the rlimit entirely (Python parity).
+    // RLIMIT_AS counts virtual address space, far more than real RSS, so skip
+    // it when the cgroup already caps RSS.
     let mem_kb = if cg_mem_cap { None } else { limits.mem_kb };
     let max_procs = limits.max_procs;
     let max_output = limits.max_output_bytes;
     let max_files = limits.max_open_files;
-    // Snapshot both inputs to the child's fd sweep before fork: the memfd must
-    // survive it (bwrap reads the filter by number), and the fallback ceiling
-    // has to be read while RLIMIT_NOFILE is still the caller's.
     let keep_fd = seccomp_fd.as_ref().map_or(-1, |f| f.as_raw_fd());
+    // Read the fd ceiling now, while RLIMIT_NOFILE is still the caller's; the
+    // child lowers it before the sweep.
     let fd_ceiling = {
         let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE as _, &mut lim) };
@@ -850,14 +833,13 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     }
 
     if pid == 0 {
-        // ---- child: async-signal-safe calls only ----
+        // Child: async-signal-safe calls only.
         unsafe {
             libc::close(sync_w);
             libc::dup2(fd_in, 0);
             libc::dup2(fd_out, 1);
             libc::dup2(fd_err, 2);
-            // Close the originals we opened (now duplicated onto 0/1/2) so they
-            // don't leak into the sandboxed program.
+            // Close the originals, now duplicated onto 0/1/2.
             if own_in && fd_in > 2 {
                 libc::close(fd_in);
             }
@@ -867,7 +849,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
             if own_err && fd_err > 2 {
                 libc::close(fd_err);
             }
-            libc::setsid(); // own process group so killpg reaches the whole run
+            libc::setsid(); // new process group, so killpg reaches the whole run
             set_rlimit(libc::RLIMIT_CPU as c_int, cpu_seconds, cpu_seconds + 1);
             if let Some(kb) = mem_kb {
                 let b = kb.saturating_mul(1024);
@@ -876,7 +858,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
             set_rlimit(libc::RLIMIT_NPROC as c_int, max_procs, max_procs);
             set_rlimit(libc::RLIMIT_FSIZE as c_int, max_output, max_output);
             set_rlimit(libc::RLIMIT_NOFILE as c_int, max_files, max_files);
-            // Block until the parent attaches perf, then exec.
+            // Wait until the parent has set up the cgroup and perf, then exec.
             let mut b = [0u8; 1];
             libc::read(sync_r, b.as_mut_ptr() as *mut c_void, 1);
             libc::close(sync_r);
@@ -886,8 +868,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
     }
 
-    // ---- parent ----
-    // The child owns its inherited copy of the seccomp memfd; drop ours.
+    // The child has its own copy of the memfd now.
     drop(seccomp_fd);
     unsafe {
         libc::close(sync_r);
@@ -902,8 +883,8 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
     }
 
-    // Enroll the child while it's parked on the sync pipe, so the whole
-    // subtree (across bwrap's new PID namespace) is accounted from exec.
+    // Move the child into the cgroup while it waits on the pipe, so
+    // everything from exec on is accounted.
     if let Some(c) = &cg {
         if let Err(e) = c.add_pid(pid) {
             if limits.require_cgroup {
@@ -926,8 +907,8 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
     }
 
-    // The child is still parked on the sync pipe here, so on a required-perf
-    // failure we can kill it before it ever execs the payload.
+    // The child is still waiting on the pipe, so if perf is required and
+    // fails, it dies before running the payload.
     let perf_fd = match perf_open_instructions(pid, limits.insn_limit) {
         Ok(fd) => Some(fd),
         Err(e) if limits.require_insn => {
@@ -973,8 +954,8 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     }
 
     let kill = || {
-        // cgroup.kill first: atomic subtree SIGKILL, immune to fork bombs and
-        // setsid escapes; killpg is the fallback (and covers --no-isolate).
+        // cgroup.kill takes the whole tree at once, including fork bombs and
+        // processes that called setsid. killpg covers runs without a cgroup.
         if let Some(c) = &cg {
             c.kill_all();
         }
@@ -988,12 +969,11 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     let mut killed: Option<&'static str> = None;
     let mut timed_out = false;
 
-    // Event-driven supervision: block in poll(2) on the pidfd (readable at
-    // child exit), wall deadline as the timeout. The tripwire kills single-
-    // task overruns in-kernel; the backstop reads cover multi-process ones —
-    // the aggregate instruction count, and the subtree CPU budget (cpu.stat),
-    // which is the only load-independent bound on kernel-mode work the
-    // instruction counter excludes by design.
+    // Sleep in poll(2) on the pidfd, which turns readable when the child
+    // exits, until the wall deadline or the next backstop check. The PMU
+    // tripwire stops a single task that runs over. The backstop reads of the
+    // total instruction count and of cpu.stat catch work spread over several
+    // processes or done in the kernel.
     let pidfd = pidfd_open(pid);
     let cores = if pinned {
         1
@@ -1005,7 +985,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
     loop {
         let w = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
         if w == pid {
-            break; // exited on its own, or tripwired (attributed below)
+            break; // exited, or killed by the tripwire (attributed below)
         }
         if w < 0 {
             return Err(io::Error::last_os_error());
@@ -1020,12 +1000,9 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
                     break;
                 }
                 Some(c) => backstop = Some(backstop_timeout(limit - c, cores)),
-                None => backstop = Some(NO_PIDFD_TICK), // unreadable: fixed tick
+                None => backstop = Some(NO_PIDFD_TICK), // unreadable: use the fixed tick
             }
         }
-        // Subtree CPU budget: per-process RLIMIT_CPU can't see a payload
-        // spreading work over short-lived children, and perf can't see
-        // kernel mode; cpu.stat covers both, tree-wide.
         if let Some(used) = cg.as_ref().and_then(|c| c.cpu_ms()) {
             if used > cpu_budget_ms {
                 killed = Some("cpu");
@@ -1050,8 +1027,9 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
         match pidfd {
             Some(fd) => {
-                // +1: poll() truncates to whole ms; rounding down would busy-
-                // spin just short of the deadline. Any wake re-runs the checks.
+                // poll() takes whole ms, and rounding down would spin just
+                // short of the deadline, hence the +1. An early wake only
+                // re-runs the checks.
                 let ms = (timeout.as_millis() + 1).min(c_int::MAX as u128) as c_int;
                 let mut pfd = libc::pollfd {
                     fd,
@@ -1088,7 +1066,7 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         unsafe { libc::close(fd) };
     }
 
-    // A tripwire kill looks like a plain SIGKILL exit; attribute it.
+    // A tripwire kill looks like any other SIGKILL, so attribute it here.
     if killed.is_none() && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL {
         if let (Some(c), Some(l)) = (instructions, limits.insn_limit) {
             if c > l {
@@ -1097,8 +1075,8 @@ pub fn run(argv: &[String], spec: &SandboxSpec, limits: &Limits) -> io::Result<R
         }
     }
 
-    // Read cgroup metrics before drop tears the cgroup down; fall back to
-    // wait4 rusage (per-process only) where the cgroup can't answer.
+    // Read the cgroup before dropping it removes it. rusage, which covers one
+    // process, fills in whatever the cgroup can't report.
     let (cg_cpu, cg_peak) = cg
         .as_ref()
         .map_or((None, None), |c| (c.cpu_usec(), c.peak_kb()));
@@ -1256,7 +1234,7 @@ mod tests {
         };
         let cmd = build_command(&args(&["python3", "m.py"]), &spec, None, true);
         assert_eq!(cmd[0], BWRAP);
-        // Read-only box by default; payload argv comes after the terminator.
+        // Read-only box by default, payload argv after the `--`.
         let ro = cmd
             .windows(3)
             .any(|w| w == args(&["--ro-bind", "/tmp/box", "/box"]));
@@ -1315,17 +1293,17 @@ mod tests {
 
     #[test]
     fn backstop_scales_with_headroom() {
-        // one peak-core-second of headroom on 1 core -> 1s sleep
+        // one second of peak-rate work on 1 core -> 1s sleep
         assert_eq!(
             backstop_timeout(PEAK_INSN_RATE_PER_CORE, 1),
             Duration::from_secs(1)
         );
-        // ten cores burn ten times faster -> a tenth of the sleep
+        // ten cores burn it ten times faster
         assert_eq!(
             backstop_timeout(PEAK_INSN_RATE_PER_CORE, 10),
             Duration::from_millis(100)
         );
-        // near-exhausted budgets floor at 1ms rather than busy-spinning
+        // a nearly spent budget still sleeps 1ms, so the loop doesn't spin
         assert_eq!(backstop_timeout(0, 16), BACKSTOP_FLOOR);
         assert_eq!(backstop_timeout(1, 16), BACKSTOP_FLOOR);
         // a failed sysconf (cores=0) must not divide by zero
@@ -1337,10 +1315,10 @@ mod tests {
 
     #[test]
     fn cpu_backstop_scales_with_headroom() {
-        // 8s of budget on 8 cores can be exhausted in 1s of wall time
+        // 8 cores can use up 8s of budget in 1s of wall time
         assert_eq!(cpu_backstop_timeout(8_000, 8), Duration::from_secs(1));
         assert_eq!(cpu_backstop_timeout(8_000, 1), Duration::from_secs(8));
-        // near-exhausted budgets floor at 1ms rather than busy-spinning
+        // a nearly spent budget still sleeps 1ms, so the loop doesn't spin
         assert_eq!(cpu_backstop_timeout(0, 8), BACKSTOP_FLOOR);
         // a failed sysconf (cores=0) must not divide by zero
         assert_eq!(cpu_backstop_timeout(8_000, 0), Duration::from_secs(8));

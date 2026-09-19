@@ -1,5 +1,5 @@
-# Burns instructions forever; tallyrun kills it at the instruction budget
-# (~5 ms poll), so the verdict lands promptly and load-invariantly.
+# Loops forever. tallyrun kills it when it reaches the instruction budget, so
+# the verdict comes quickly and doesn't depend on machine load.
 i = 0
 while True:
     i += 1

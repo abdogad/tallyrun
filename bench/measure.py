@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """tallyrun variance study: instruction count vs CPU time vs wall time.
 
-Methodology follows COFFE (arXiv:2502.02827): run each workload N times,
-drop the min and max, report the relative standard deviation (RSD) of the
-rest. Conditions: idle machine, then loaded (2x nproc shell busy-loops).
-Also measures the bwrap isolation offset (isolated minus bare instruction
-count) and its run-to-run stability.
+Follows COFFE (arXiv:2502.02827): run each workload N times, drop the min
+and max, and report the relative standard deviation (RSD) of the rest, first
+on an idle machine and then under load (2x nproc shell busy-loops). Also
+measures the bwrap isolation offset (isolated minus bare instruction count)
+and how stable it is between runs.
 
-All runs go through `tallyrun run --no-isolate` so cpu_ms/peak_kb come from
-wait4 on the payload itself (no PID-namespace blind spot); the isolation
-offset experiment is the only part that uses `--box`.
+Runs use `tallyrun run --no-isolate`, so there's no PID namespace between
+tallyrun and the payload. Only the isolation offset runs use `--box`.
 
 Usage:
-    python bench/measure.py               # full study (~3-5 min, lags the box)
+    python bench/measure.py               # full study (~3-5 min, machine lags)
     python bench/measure.py --quick       # 4 runs, idle only (sanity check)
     python bench/measure.py --skip-load   # skip the loaded condition
 
@@ -57,9 +56,9 @@ TEMP_SENSOR = _cpu_temp_sensor()
 
 
 def telemetry():
-    """(package °C, max core MHz) right now — evidence against thermal/governor
-    confounds: thermal drift shows as temp trending with cpu_ms, governor
-    parking as low MHz on slow runs."""
+    """Current (package °C, max core MHz), recorded per run to rule out
+    thermal and governor effects. Thermal drift would show as temperature
+    rising with cpu_ms, and a parked governor as low MHz on slow runs."""
     temp = None
     if TEMP_SENSOR:
         temp = int(TEMP_SENSOR.read_text()) // 1000
@@ -155,14 +154,15 @@ def isolation_offset(runs):
         pin = {"PYTHONHASHSEED": "0"}
         bare = [run_once([PY, str(WL / "cpu.py")], pin)["instructions"]
                 for _ in range(runs)]
-        # bwrap pins PYTHONHASHSEED itself; binary resolved via sandbox PATH
+        # the sandbox pins PYTHONHASHSEED itself; python3 comes from its PATH
         iso = [run_once(["python3", "cpu.py"], pin, ("--box", box))["instructions"]
                for _ in range(runs)]
     return {"bare": bare, "isolated": iso}
 
 
 class Load:
-    """2x-nproc shell busy-loops: oversubscription + all-core boost clocks."""
+    """2x nproc shell busy-loops, to oversubscribe the CPUs and hold them at
+    all-core boost clocks."""
 
     def __init__(self, n):
         self.n, self.procs = n, []

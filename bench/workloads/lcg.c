@@ -1,8 +1,8 @@
-/* Register-only dependency chain (LCG): the well-behaved compiled baseline.
- * No memory traffic in the hot loop, so ~4 cycles/iteration on Zen 2 (imul 3
- * + add 1) — CPU time is as stable as compiled time gets. Contrast with
- * spin.c, whose volatile store-load chain is time-bimodal (up to 8x) on the
- * same tuned machine. */
+/* LCG dependency chain in registers: the well-behaved compiled baseline.
+ * The hot loop never touches memory, so it takes ~4 cycles per iteration on
+ * Zen 2 (imul 3 + add 1) and its CPU time is as stable as compiled code
+ * gets. Compare spin.c, whose volatile store-load chain has two speeds, up
+ * to 8x apart, on the same tuned machine. */
 #include <stdio.h>
 
 int main(void) {

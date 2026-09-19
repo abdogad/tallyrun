@@ -1,5 +1,5 @@
-"""Core sandbox behaviour, exercised through the CLI JSON contract.
-Cgroup- and perf-dependent asserts skip where the host can't provide them."""
+"""Basic sandbox behavior, checked through the CLI's JSON output. Cgroup and
+perf asserts skip where the host lacks them."""
 
 import shutil
 
@@ -40,7 +40,7 @@ def test_network_is_unreachable(tmp_path):
         "import socket, sys\n"
         "try:\n"
         "    socket.create_connection(('1.1.1.1', 80), timeout=2)\n"
-        "    sys.exit(0)\n"       # reachable — should never happen
+        "    sys.exit(0)\n"       # reachable: should never happen
         "except OSError:\n"
         "    sys.exit(42)\n"})
     res = run_box(tmp_path, [PY, "n.py"])
@@ -63,7 +63,7 @@ def test_box_is_readonly_for_runs(tmp_path):
         "except OSError:\n"
         "    sys.exit(30)\n"})
     assert run_box(tmp_path, [PY, "w.py"])["exit_code"] == 30
-    # ... but a compile step can opt in with --writable.
+    # A compile step can opt in with --writable.
     assert run_box(tmp_path, [PY, "w.py"], writable=True)["exit_code"] == 0
 
 
@@ -88,8 +88,8 @@ def test_extra_bind_is_readable(tmp_path):
 
 
 def test_hash_seed_is_pinned(tmp_path):
-    # Measurement fairness: hash randomization is CPython's dominant noise
-    # source (docs/BENCHMARK.md, Result 4), so the sandbox env pins it.
+    # Hash randomization is CPython's largest noise source
+    # (docs/BENCHMARK.md, Result 4), so the sandbox pins the seed.
     write_box(tmp_path, {"env.py": "import os; print(os.environ['PYTHONHASHSEED'])"})
     res = run_box(tmp_path, [PY, "env.py"])
     assert res["exit_code"] == 0
@@ -114,13 +114,13 @@ def test_insn_limit_gives_load_invariant_tle(tmp_path):
     res = run_box(tmp_path, [PY, "loop.py"], insn=200_000_000, wall=10000)
     assert res["killed"] == "instructions"
     assert res["signal"] == 9
-    assert not res["timed_out"]  # deterministic kill, not the wall safety net
+    assert not res["timed_out"]  # killed by the budget, not the wall timeout
 
 
 @needs_cgroup
 def test_pin_cpu_confines_the_tree(tmp_path):
-    # cpuset pinning is kernel-enforced: even after the payload tries to
-    # widen its own affinity, the mask stays clamped to the pinned CPU.
+    # The payload widens its own affinity, and the cpuset still keeps it on
+    # the pinned CPU.
     write_box(tmp_path, {"aff.py": (
         "import os\n"
         "os.sched_setaffinity(0, range(os.cpu_count()))  # escape attempt\n"
@@ -137,8 +137,8 @@ def test_pin_cpu_confines_the_tree(tmp_path):
 
 @needs_cgroup
 def test_cpu_and_rss_are_subtree_accurate(tmp_path):
-    # The whole point of the cgroup port: bwrap's PID namespace hides the
-    # payload from wait4, so only cgroup accounting sees this burn.
+    # bwrap's PID namespace hides the payload from wait4, so only the cgroup
+    # sees this CPU time.
     write_box(tmp_path, {"burn.py":
         "x = 0\n"
         "for _ in range(20_000_000):\n"
@@ -146,7 +146,7 @@ def test_cpu_and_rss_are_subtree_accurate(tmp_path):
     res = run_box(tmp_path, [PY, "burn.py"], cpu_s=10, wall=10000)
     assert res["exit_code"] == 0
     assert res["accounting"] == "cgroup"
-    assert res["cpu_ms"] > 50            # the wait4 shim reported ~2ms here
+    assert res["cpu_ms"] > 50            # wait4 alone sees ~2ms (just bwrap)
     assert res["peak_kb"] > 4000         # real interpreter RSS, not bwrap's
 
 

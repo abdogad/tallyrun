@@ -1,9 +1,6 @@
-//! `tallyrun run [OPTIONS] -- <command...>` — run one command isolated, measure
-//! its instruction count, enforce limits, print one JSON line of results to
-//! stdout. This is the contract a judge consumes as a subprocess (docs/CONTRACT.md).
-//!
-//! The option list lives once, in `HELP` below, which `--help` prints
-//! verbatim; a second copy here only gave the two something to drift over.
+//! `tallyrun run [OPTIONS] -- <command...>`: run one command in the sandbox
+//! and print one JSON line to stdout (docs/CONTRACT.md). The options are
+//! documented once, in `HELP`.
 
 use std::path::PathBuf;
 use std::process::exit;

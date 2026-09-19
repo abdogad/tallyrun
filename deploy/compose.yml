@@ -1,15 +1,16 @@
-# Grants cgroup-v2 delegation so tallyrun can create per-run cgroups and measure
-# CPU time + peak RSS deterministically. No --privileged, no added capabilities.
+# Delegates cgroup v2 so tallyrun can create per-run cgroups and measure CPU
+# time and peak RSS for the whole process tree. Needs neither --privileged
+# nor added capabilities.
 services:
   tallyrun:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    # cgroup:host + a writable cgroup fs is what enables per-run accounting.
+    # cgroup: host and a writable /sys/fs/cgroup enable per-run accounting.
+    # Without them the sandbox still runs, but accounting falls back to
+    # per-process rusage ("accounting":"rusage" in the JSON): cpu_ms and
+    # peak_kb miss forked children, the memory cap becomes RLIMIT_AS, and the
+    # tree-wide CPU budget isn't enforced.
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    # Without these two lines the sandbox still runs, but accounting degrades
-    # to per-process rusage ("accounting":"rusage" in the JSON): cpu_ms and
-    # peak_kb stop covering forked children, the memory cap falls back to
-    # RLIMIT_AS, and the subtree CPU budget is not enforced.

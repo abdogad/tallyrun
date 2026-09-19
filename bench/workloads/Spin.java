@@ -1,5 +1,6 @@
-// Run via the source launcher (`java Spin.java`): measures in-process javac +
-// JVM startup + C2 JIT of a hot loop — the noisiest realistic judge runtime.
+// Run with the source launcher (`java Spin.java`), so the count includes
+// in-process javac, JVM startup and the C2 JIT of a hot loop. This is the
+// noisiest runtime a judge realistically sees.
 public class Spin {
     public static void main(String[] args) {
         long s = 0;

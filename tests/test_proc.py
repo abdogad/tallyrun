@@ -1,10 +1,9 @@
-"""/proc isolation: by default the sandbox gets a fresh procfs scoped to its
-own PID namespace, so host process IDs and command lines are not visible.
---proc-bind restores the old host-/proc bind (and its leak) for callers stuck
-in a masked-procfs container.
+"""/proc isolation. By default the sandbox gets a fresh procfs for its own PID
+namespace, so host PIDs and command lines stay hidden. --proc-bind binds the
+host /proc instead, for masked-procfs containers.
 
-Skips where a fresh procfs can't be mounted (the same hardened-container case
-tallyrun itself auto-detects and falls back on) — there is nothing to prove."""
+The tests skip where a fresh procfs can't be mounted, the same hardened
+container case tallyrun detects and falls back on."""
 
 import shutil
 
@@ -26,8 +25,8 @@ def _pid_count(box, **kw):
 
 
 def test_default_proc_hides_host_pids(tmp_path):
-    # A fresh procfs sees only the sandbox's own tree: the payload, its shell,
-    # and bwrap's namespace init — a handful, never the host's hundreds.
+    # A fresh procfs lists only the sandbox's own few processes, where the
+    # host has hundreds.
     n = _pid_count(tmp_path)
     if n > 20:
         pytest.skip("fresh procfs unavailable here (tallyrun auto-fell-back to bind)")
@@ -35,7 +34,7 @@ def test_default_proc_hides_host_pids(tmp_path):
 
 
 def test_proc_bind_opts_back_into_host_view(tmp_path):
-    # The escape hatch still exposes the host's process list.
+    # --proc-bind shows the host's processes again.
     default = _pid_count(tmp_path)
     if default > 20:
         pytest.skip("fresh procfs unavailable; bind is already the default here")
@@ -44,13 +43,13 @@ def test_proc_bind_opts_back_into_host_view(tmp_path):
 
 
 def test_default_proc_hides_host_cmdlines(tmp_path):
-    # The sharper leak: not just that host PIDs exist, but that their command
-    # lines (argv) are readable. Under a fresh procfs, pid 1 is our own init.
+    # Host command lines leak more than bare PIDs do. Under a fresh procfs,
+    # pid 1 is the sandbox's own init.
     write_box(tmp_path, {"who.py":
         "print(open('/proc/1/cmdline','rb').read().split(b'\\0')[0].decode())"})
     res = run_box(tmp_path, ["python3", "who.py"])
     pid1 = res["_stdout"].strip()
     if "systemd" in pid1 or "init" in pid1:
         pytest.skip("fresh procfs unavailable (bind fallback shows host pid 1)")
-    # bwrap is the sandbox's own namespace init — not a host process.
+    # pid 1 in the sandbox is bwrap's namespace init.
     assert "bwrap" in pid1

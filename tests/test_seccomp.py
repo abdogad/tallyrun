@@ -1,10 +1,9 @@
-"""The seccomp denylist: kernel attack surface is closed to sandboxed code,
-and blocked-but-probed syscalls read as ENOSYS so runtimes take their tested
-fallback paths (glibc clone3 -> clone, libuv io_uring -> epoll). Probes exit
-with the errno the syscall produced, so the asserts read as errno checks.
+"""The seccomp denylist. Dangerous syscalls fail, and the ones runtimes probe
+return ENOSYS so they take their fallback paths (glibc clone3 -> clone, libuv
+io_uring -> epoll). Each probe exits with the errno its syscall returned.
 
-The rest of the suite doubles as the compatibility proof: every other test
-(fork bombs, compiles, floods) runs under the default-on filter."""
+The filter is on by default, so the rest of the suite also checks that it
+doesn't break ordinary programs."""
 
 import shutil
 
@@ -17,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 EPERM, ENOSYS = 1, 38
-# Generic syscall numbers — identical on x86_64 and aarch64.
+# These numbers are the same on x86_64 and aarch64.
 SYS_CLONE3, SYS_IO_URING_SETUP = 435, 425
 
 PROBE = """\
@@ -34,16 +33,15 @@ def errno_of(box, call, *, no_seccomp=False):
 
 
 def test_nested_userns_is_blocked(tmp_path):
-    # unshare(CLONE_NEWUSER): the "unprivileged user gains a namespace where
-    # it is root" amplifier behind most container-era kernel LPEs.
+    # unshare(CLONE_NEWUSER) makes an unprivileged user root inside a new
+    # namespace, the step behind most container-era kernel LPEs.
     assert errno_of(tmp_path, "libc.unshare(0x10000000)") == EPERM
 
 
 def test_fork_and_subprocess_survive_the_filter(tmp_path):
-    # The compatibility keystone: clone3 -> ENOSYS forces glibc onto clone(),
-    # whose flags the filter inspects (CLONE_NEWUSER denied, fork/thread
-    # shapes allowed — flag semantics unit-tested in src/seccomp.rs). If the
-    # fallback chain broke, every subprocess/fork in every runtime would too.
+    # clone3 returns ENOSYS, so glibc falls back to clone(), whose flags the
+    # filter checks (unit tests in src/seccomp.rs). If that fallback broke,
+    # fork and subprocess would fail in every runtime.
     write_box(tmp_path, {"fork.py":
         "import subprocess, sys\n"
         "sys.exit(subprocess.run(['/bin/true']).returncode)\n"})
@@ -65,8 +63,8 @@ def test_ptrace_is_blocked(tmp_path):
 
 
 def test_no_seccomp_flag_removes_the_filter(tmp_path):
-    # Differential proof the flag works: clone3(NULL, 0) hits the real kernel
-    # and fails argument validation (EINVAL) instead of the filter's ENOSYS.
+    # Without the filter, clone3(NULL, 0) reaches the kernel and fails with
+    # EINVAL instead of the filter's ENOSYS.
     errno = errno_of(tmp_path, f"libc.syscall({SYS_CLONE3}, None, 0)",
                      no_seccomp=True)
     assert errno != ENOSYS

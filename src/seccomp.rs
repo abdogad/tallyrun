@@ -1,27 +1,24 @@
-//! Seccomp-bpf denylist: close the kernel's optional attack surface to
-//! sandboxed code without breaking real language runtimes.
+//! A seccomp-bpf denylist that blocks kernel interfaces sandboxed code has no
+//! use for, while normal language runtimes keep working.
 //!
-//! Why a denylist: a judge runs arbitrary runtimes (CPython, JVM, V8, compiled
-//! anything), and a strict allowlist breaks every time a libc or JIT learns a
-//! new syscall. What actually protects the host is removing the interfaces
-//! kernel exploits are built from — nested user namespaces, `bpf`, `io_uring`,
-//! `userfaultfd`, `keyctl`, mount/ptrace/module machinery — which no
-//! submission has a legitimate reason to touch. Same philosophy as the
-//! default Docker/systemd profiles.
+//! It's a denylist because a judge runs whatever the submission needs
+//! (CPython, the JVM, V8, compiled binaries), and an allowlist breaks each
+//! time a libc or JIT starts using a new syscall. The calls blocked here are
+//! the ones kernel exploits tend to be built on: nested user namespaces,
+//! `bpf`, `io_uring`, `userfaultfd`, `keyctl`, and the mount, ptrace and
+//! module calls. The default Docker and systemd profiles work the same way.
 //!
-//! Two flavors of denial:
-//! - `EPERM` for syscalls nothing legitimate calls (mount, ptrace, bpf, ...).
-//! - `ENOSYS` for syscalls runtimes probe-and-fall-back on: glibc retries
-//!   `clone3` as `clone` (which we *can* flag-inspect), libuv falls back from
-//!   io_uring to epoll. `EPERM` there can abort a runtime; `ENOSYS` reads as
-//!   "old kernel" and takes the tested fallback path.
+//! Most denied calls get `EPERM`. Calls that runtimes probe and then fall
+//! back from get `ENOSYS`, which reads as "old kernel": glibc retries `clone3`
+//! as `clone` (whose flags the filter can inspect), and libuv falls back from
+//! io_uring to epoll. `EPERM` on those can make a runtime abort.
 //!
-//! The program is hand-assembled cBPF (tallyrun's only dependency stays libc);
-//! bwrap loads it via `--seccomp FD` as the last step before exec'ing the
-//! payload, and it inherits across the whole process tree. Syscall numbers
-//! come from `libc::SYS_*`, so the same table builds correctly per
-//! architecture. A hard KILL closes the two filter-bypass routes: a foreign
-//! audit arch, and (on x86_64) the x32 syscall numbering.
+//! The program is hand-assembled cBPF, so libc stays the only dependency.
+//! bwrap installs it with `--seccomp FD` just before exec'ing the payload,
+//! and every process in the tree inherits it. Syscall numbers come from
+//! `libc::SYS_*`, so the table is right on each architecture. A foreign
+//! audit arch, or an x32 syscall number on x86_64, kills the process, since
+//! either would let a call get past the table.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -30,7 +27,7 @@ use std::os::raw::c_void;
 // cBPF opcodes (BPF_CLASS | BPF_SIZE/BPF_OP | BPF_MODE/BPF_SRC).
 const LD_W_ABS: u16 = 0x20; // BPF_LD  | BPF_W   | BPF_ABS
 const JEQ_K: u16 = 0x15; //    BPF_JMP | BPF_JEQ | BPF_K
-#[cfg(any(target_arch = "x86_64", test))] // only the x32-bit check uses it
+#[cfg(any(target_arch = "x86_64", test))] // only the x32 check uses it
 const JGE_K: u16 = 0x35; //    BPF_JMP | BPF_JGE | BPF_K
 const JSET_K: u16 = 0x45; //   BPF_JMP | BPF_JSET| BPF_K
 const RET_K: u16 = 0x06; //    BPF_RET | BPF_K
@@ -68,17 +65,17 @@ const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
 
-/// Syscalls denied with EPERM: privileged or pointless inside the sandbox;
-/// nothing a language runtime calls on any normal path.
+/// Syscalls that get EPERM: privileged or useless in the sandbox, and not
+/// called by any runtime in normal use.
 fn deny_eperm() -> Vec<i64> {
     let mut nrs: Vec<i64> = vec![
-        // tracing / cross-process memory
+        // tracing and cross-process memory
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
         libc::SYS_kcmp,
-        libc::SYS_pidfd_getfd, // steal another process's fds; same family
-        // mount machinery (old and new API) + escape classics
+        libc::SYS_pidfd_getfd, // copies another process's fds
+        // mount API, old and new, plus the classic escape calls
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
@@ -91,7 +88,7 @@ fn deny_eperm() -> Vec<i64> {
         libc::SYS_fspick,
         libc::SYS_mount_setattr,
         libc::SYS_open_by_handle_at,
-        // namespaces (nested userns is the big kernel-LPE amplifier)
+        // namespaces; nested user namespaces are the main kernel-LPE amplifier
         libc::SYS_setns,
         libc::SYS_unshare,
         // kernel attack surface
@@ -103,7 +100,7 @@ fn deny_eperm() -> Vec<i64> {
         libc::SYS_request_key,
         libc::SYS_lookup_dcookie,
         libc::SYS_syslog,
-        // module / kexec / accounting / quota — root-only, deny for depth
+        // module, kexec, accounting, quota: root-only anyway, denied for depth
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
@@ -127,10 +124,10 @@ fn deny_eperm() -> Vec<i64> {
     nrs
 }
 
-/// Syscalls denied with ENOSYS: callers are known to probe and fall back.
+/// Syscalls that get ENOSYS because callers probe them and fall back.
 fn deny_enosys() -> Vec<i64> {
     vec![
-        libc::SYS_clone3, // forces flags through clone(), inspected below
+        libc::SYS_clone3, // sends glibc to clone(), whose flags are checked
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
@@ -141,8 +138,8 @@ fn deny_enosys() -> Vec<i64> {
 pub fn filter_program() -> Vec<SockFilter> {
     let mut p = Vec::with_capacity(96);
 
-    // Wrong audit arch (or x32 numbering) means every jeq below would compare
-    // against the wrong table: kill, don't guess.
+    // With a foreign audit arch or x32 numbering, every jeq below would
+    // compare against the wrong table, so kill.
     p.push(insn(LD_W_ABS, 0, 0, OFF_ARCH));
     p.push(insn(JEQ_K, 1, 0, AUDIT_ARCH));
     p.push(insn(RET_K, 0, 0, RET_KILL_PROCESS));
@@ -153,9 +150,9 @@ pub fn filter_program() -> Vec<SockFilter> {
         p.push(insn(RET_K, 0, 0, RET_KILL_PROCESS));
     }
 
-    // clone(): allowed, except CLONE_NEWUSER in the flags (arg0 on x86_64 and
-    // aarch64). clone3 is ENOSYS'd above precisely so flags land here, where
-    // cBPF can see them (clone3 passes them in a struct it cannot read).
+    // clone() is allowed unless its flags (arg0 on x86_64 and aarch64)
+    // include CLONE_NEWUSER. clone3 gets ENOSYS so callers fall back to
+    // clone(): clone3 passes its flags in a struct, which cBPF can't read.
     p.push(insn(JEQ_K, 0, 4, libc::SYS_clone as u32));
     p.push(insn(LD_W_ABS, 0, 0, OFF_ARG0_LO));
     p.push(insn(JSET_K, 0, 1, libc::CLONE_NEWUSER as u32));
@@ -175,9 +172,9 @@ pub fn filter_program() -> Vec<SockFilter> {
     p
 }
 
-/// Write the compiled program into a memfd (offset rewound to 0) that bwrap
-/// consumes via `--seccomp FD`. Created without CLOEXEC: it must survive the
-/// exec into bwrap; the parent drops its copy after fork.
+/// Write the program to a memfd, rewound to offset 0, for bwrap's
+/// `--seccomp FD`. No CLOEXEC, because the fd has to survive the exec into
+/// bwrap; the parent drops its copy after fork.
 pub fn install_fd() -> io::Result<OwnedFd> {
     let prog = filter_program();
     let bytes: &[u8] = unsafe {
@@ -213,8 +210,8 @@ pub fn install_fd() -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
 
-    /// Minimal cBPF interpreter over the opcodes the assembler emits, so the
-    /// tests assert the filter's *semantics*, not its byte layout.
+    /// Runs the few opcodes the assembler emits, so tests can check what the
+    /// filter decides for a given syscall.
     fn eval(prog: &[SockFilter], arch: u32, nr: u32, arg0: u64) -> u32 {
         let word = |off: u32| match off {
             OFF_NR => nr,
@@ -299,9 +296,8 @@ mod tests {
 
     #[test]
     fn exhaustive_syscall_sweep_matches_the_deny_tables() {
-        // Every syscall number the kernel could present gets exactly the
-        // verdict its table says — a jump off-by-one anywhere in the
-        // assembled program would misroute a neighboring syscall.
+        // Every syscall number gets exactly the verdict its table says. An
+        // off-by-one jump anywhere would misroute a neighboring syscall.
         let p = filter_program();
         let eperm: Vec<u32> = deny_eperm().iter().map(|&n| n as u32).collect();
         let enosys: Vec<u32> = deny_enosys().iter().map(|&n| n as u32).collect();

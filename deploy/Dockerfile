@@ -1,8 +1,8 @@
-# Reference image: the tallyrun binary + bubblewrap + toolchains, with tini as
-# PID 1 (reaps the foreign children bwrap reparents on exit). Run it with
-# cgroup delegation (deploy/compose.yml) for full accounting; instruction
-# counting additionally needs a PMU and a seccomp profile that allows
-# perf_event_open (the default Docker profile blocks it).
+# Reference image: tallyrun, bubblewrap and toolchains, with tini as PID 1 to
+# reap the processes reparented to it when bwrap exits. Run it with cgroup
+# delegation (deploy/compose.yml) for full accounting. Instruction counting
+# also needs a PMU and a seccomp profile that allows perf_event_open, which
+# Docker's default profile blocks.
 FROM rust:1-slim AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -20,6 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /src/target/release/tallyrun /usr/local/bin/tallyrun
 
 ENTRYPOINT ["tini", "--"]
-# The smoke test greets on stderr: tallyrun's stdout carries the JSON result
-# and the sandboxed program is not allowed to share it.
+# The smoke test prints to stderr because tallyrun's stdout carries the JSON
+# result, and the program can't write there.
 CMD ["tallyrun", "run", "--no-isolate", "--", "python3", "-c", "import sys; print('tallyrun ready', file=sys.stderr)"]

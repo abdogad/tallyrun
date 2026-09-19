@@ -1,20 +1,18 @@
-"""Shared harness: every test drives the release binary as a subprocess and
-parses its one-line JSON contract — the same way a judge consumes tallyrun.
+"""Test harness. Each test runs the release binary as a subprocess and parses
+its JSON line, the same way a judge would.
 
-Capability probes make the suite portable: cgroup-dependent asserts skip
-where delegation is unavailable (plain CI), instruction asserts skip without
-a PMU (most CI runners).
+The suite probes the host first: cgroup asserts skip without cgroup
+delegation (plain CI), and instruction asserts skip without a PMU (most CI
+runners).
 
-Locally, tallyrun must NOT be invoked straight from a desktop app's systemd
-scope (an IDE terminal): its cgroup dance would migrate that scope's
-processes, and a memory-bomb test OOM-killed in its per-run cgroup bubbles
-an oom_kill event up the hierarchy into the scope's memory.events — systemd's
-default OOMPolicy=stop then stops the WHOLE scope, editor included (the
-desktop shows it as "memory shortage avoided"). So `run_box` launches every
-tallyrun invocation inside its own throwaway transient scope
-(`systemd-run --scope -p OOMPolicy=continue`), a sibling of the IDE's scope
-rather than a descendant; where no systemd user manager is reachable (CI
-containers) it runs un-scoped, which is fine there.
+Every tallyrun call runs in its own transient systemd scope with
+OOMPolicy=continue. Started straight from an IDE terminal, tallyrun's cgroup
+setup would move the processes of the IDE's scope, and a memory-bomb test's
+OOM kill would be counted in that scope's memory.events. systemd's default
+OOMPolicy=stop then stops the whole scope, editor included (the desktop
+calls it "memory shortage avoided"). The transient scope is a sibling of the
+IDE's, so the event never reaches it. Without a systemd user manager (CI
+containers) runs go unscoped, which is fine there.
 """
 
 import json
@@ -29,8 +27,8 @@ TALLYRUN = REPO / "target" / "release" / "tallyrun"
 
 
 def _scope_prefix():
-    """Command prefix isolating one tallyrun run in its own transient systemd
-    scope (docstring above); empty where no user manager answers (CI)."""
+    """Prefix that runs one tallyrun call in its own systemd scope (see the
+    module docstring), or [] when no user manager answers (CI)."""
     if shutil.which("systemd-run") is None:
         return []
     prefix = ["systemd-run", "--user", "--scope", "-q",
@@ -49,8 +47,8 @@ pytestmark = pytest.mark.skipif(
 def run_box(box, argv, *, wall=5000, cpu_s=3, mem_kb=131072, insn=None,
             writable=False, binds=(), stdin=None, no_seccomp=False,
             proc_bind=False, pin_cpu=None):
-    """Run argv in the sandbox at `box`; return the parsed JSON result with
-    the captured stdout text attached as res['_stdout']."""
+    """Run argv in the sandbox at `box` and return the parsed JSON, with the
+    program's output added as res['_stdout'] and res['_stderr']."""
     box = Path(box)
     out, err = box / "o", box / "e"
     cmd = [*SCOPE, str(TALLYRUN), "run", "--box", str(box),
@@ -73,8 +71,8 @@ def run_box(box, argv, *, wall=5000, cpu_s=3, mem_kb=131072, insn=None,
         cmd += ["--pin-cpu", str(pin_cpu)]
     cmd += ["--", *argv]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    # tallyrun mirrors the child's exit code, so its own failures (usage error,
-    # run failure) are recognized by the absence of the JSON line, not by code.
+    # The exit code mirrors the payload's, so a failure in tallyrun itself
+    # shows up as a missing JSON line.
     lines = p.stdout.strip().splitlines()
     assert lines, f"tallyrun produced no result (exit {p.returncode}): {p.stderr}"
     res = json.loads(lines[-1])
@@ -89,7 +87,7 @@ def write_box(box, files):
 
 
 def _probe():
-    """One trivial isolated run tells us which capabilities this host has."""
+    """Run /bin/true once to see what this host can measure."""
     if not TALLYRUN.exists() or shutil.which("bwrap") is None:
         return False, False
     import tempfile
@@ -108,8 +106,8 @@ HAVE_CG, HAVE_INSN = _probe()
 
 
 def pytest_report_header(config):
-    # One glance at a CI log answers "what could this host measure?" —
-    # e.g. a broken bwrap shows up as every capability False.
+    # Puts what the host could measure at the top of the CI log. A broken
+    # bwrap shows up as everything False.
     return f"tallyrun capabilities: cgroup={HAVE_CG} instructions={HAVE_INSN}"
 
 needs_cgroup = pytest.mark.skipif(

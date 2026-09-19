@@ -1,17 +1,15 @@
 name: release
 
-# Tag a commit `v*` (e.g. v0.1.0) and push it: this builds fully static musl
-# binaries for x86_64 and aarch64 — they run on any Linux distro/container
-# regardless of glibc version, which is what deployments download — runs the
-# test suite against the x86_64 one (the runner's arch; the aarch64 build is
-# compile+static-checked only), and attaches binaries + checksums to a
-# GitHub release.
+# Pushing a `v*` tag (e.g. v0.1.0) builds static musl binaries for x86_64 and
+# aarch64, which run on any distro or container whatever its glibc. The test
+# suite runs against the x86_64 binary (the runner's arch); the aarch64 one is
+# only checked to be static. Both go into a GitHub release with checksums.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write # create the release + upload assets
+  contents: write # create the release and upload assets
 
 jobs:
   release:
@@ -19,10 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y musl-tools bubblewrap gcc-aarch64-linux-gnu
-      # Same as ci.yml: the runner image ships the AppArmor unprivileged-userns
-      # restriction enabled, which blocks bwrap and fails the whole suite.
+      # Same as ci.yml: the runner's AppArmor userns restriction blocks bwrap.
       - name: Enable unprivileged user namespaces (bwrap needs them)
-        # Mirrors tallyrun's mount plan — see ci.yml for why the symlinks matter.
+        # Same mounts as tallyrun; ci.yml explains the symlinks.
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --unshare-all --die-with-parent --ro-bind /usr /usr \
@@ -34,9 +31,9 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target aarch64-unknown-linux-musl
-      # The pytest suite drives target/release/tallyrun; point that path at the
-      # musl build so the artifact itself is what gets tested. (cgroup- and
-      # PMU-dependent asserts skip on GitHub runners, as in ci.yml.)
+      # pytest runs target/release/tallyrun, so copy the musl build there and
+      # test the binary that ships. cgroup and PMU asserts skip on GitHub
+      # runners, as in ci.yml.
       - run: |
           mkdir -p target/release
           cp target/x86_64-unknown-linux-musl/release/tallyrun target/release/tallyrun
@@ -46,7 +43,7 @@ jobs:
           mkdir dist
           cp target/x86_64-unknown-linux-musl/release/tallyrun dist/tallyrun-x86_64-unknown-linux-musl
           cp target/aarch64-unknown-linux-musl/release/tallyrun dist/tallyrun-aarch64-unknown-linux-musl
-          # Guard the release promise: both artifacts must be static.
+          # Fail the release if either binary isn't static.
           (ldd dist/tallyrun-x86_64-unknown-linux-musl 2>&1 || true) | grep -Eq 'not a dynamic|statically linked'
           file dist/tallyrun-aarch64-unknown-linux-musl | grep -Eq 'aarch64.*(statically linked|static-pie)'
           cd dist && sha256sum tallyrun-* > SHA256SUMS

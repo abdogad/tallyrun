@@ -1,7 +1,6 @@
-/* Memory-bound worst case: 64 MiB working set walked with a fixed-seed LCG,
- * so nearly every access misses cache and the first pass page-faults ~16k
- * times. This is the workload where "page faults perturb the count" should
- * show up if it's going to. */
+/* Memory-bound worst case: a fixed-seed LCG walks a 64 MiB array, so nearly
+ * every access misses cache and the first pass takes ~16k page faults. If
+ * page faults disturbed the instruction count, it would show here. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

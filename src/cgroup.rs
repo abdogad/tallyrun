@@ -1,17 +1,17 @@
-//! Per-run cgroup v2: subtree-accurate CPU + peak-RSS accounting across
-//! bwrap's PID namespace, real memory caps, and atomic `cgroup.kill` teardown.
+//! One cgroup v2 per run. It reports CPU time and peak RSS for the whole
+//! process tree (wait4 stops at bwrap's PID namespace), caps real RSS, and
+//! tears the run down with `cgroup.kill`.
 //!
-//! cgroup v2 forbids a cgroup from having both member processes and
-//! controllers enabled for its children ("no internal processes" rule), so
-//! `setup` vacates the current cgroup by moving every member into a
-//! `tallyrun-init` leaf, then enables controllers in `cgroup.subtree_control`.
-//! Per-run cgroups are created as siblings of the leaf. Subsequent
-//! invocations are born inside the leaf (their parent was moved there) and
-//! skip straight to creating run cgroups.
+//! cgroup v2 doesn't let a cgroup hold processes while it has controllers
+//! enabled for its children (the "no internal processes" rule). So `setup`
+//! moves every process in the current cgroup into a `tallyrun-init` leaf and
+//! enables the controllers; run cgroups are then created next to that leaf.
+//! Later invocations start inside the leaf, because their parent was moved
+//! there, and go straight to creating run cgroups.
 //!
-//! Deployments can instead prepare a delegated directory themselves and point
-//! `TALLYRUN_CGROUP_DIR` (or `--cgroup-dir`) at it; tallyrun then only creates
-//! per-run children there and never migrates anything.
+//! A deployment can instead prepare a delegated directory and point
+//! `TALLYRUN_CGROUP_DIR` or `--cgroup-dir` at it. tallyrun then only creates
+//! run cgroups there and never moves processes.
 
 use std::fs;
 use std::io;
@@ -21,15 +21,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const INIT_LEAF: &str = "tallyrun-init";
-// Controller sets to try, richest first. cpu is deliberately not requested:
-// cgroup core maintains cpu.stat's usage_usec on every cgroup regardless, so
-// a bare child cgroup already gives subtree-accurate CPU; controllers are
-// only needed for the memory cap/peak, pids.max, and (--pin-cpu only)
-// cpuset.cpus. An enabled-but-unused cpuset constrains nothing.
+// Controller sets to try, largest first. There's no +cpu because the cgroup
+// core keeps usage_usec in cpu.stat for every cgroup anyway. The controllers
+// are for the memory cap and peak, pids.max, and cpuset.cpus, which only
+// --pin-cpu sets (an enabled cpuset that is never set restricts nothing).
 const CONTROLLER_SETS: [&str; 3] = ["+memory +pids +cpuset", "+memory +pids", "+memory"];
 const ENABLE_RETRIES: u32 = 20;
-// cgroup.kill is asynchronous: killed tasks linger as "dying" and rmdir
-// returns EBUSY until the kernel reaps them, so removal polls.
+// cgroup.kill is asynchronous. Killed tasks stay around as "dying" and rmdir
+// fails with EBUSY until the kernel reaps them, so removal retries.
 const REMOVE_RETRIES: u32 = 100;
 const RETRY_SLEEP: Duration = Duration::from_millis(5);
 
@@ -53,9 +52,9 @@ fn subtree_has(base: &Path, controller: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Move every member of `base` (ourselves included) into the init leaf, then
-/// enable controllers for children. Retried because concurrent tallyrun
-/// invocations may keep appearing in `base` between the move and the enable.
+/// Move every process in `base`, this one included, into the init leaf, then
+/// enable controllers for children. Retries because other tallyrun processes
+/// can appear in `base` between the move and the enable.
 fn vacate_and_enable(base: &Path) -> io::Result<()> {
     let leaf = base.join(INIT_LEAF);
     match fs::create_dir(&leaf) {
@@ -82,16 +81,15 @@ fn vacate_and_enable(base: &Path) -> io::Result<()> {
     Err(last_err)
 }
 
-/// Find (or prepare) the directory where per-run cgroups may be created.
-/// Never hard-fails over missing controllers: a bare child cgroup still
-/// yields subtree CPU; memory metrics just degrade (visible via
-/// `RunCgroup::has_memory_cap` / `has_memory_peak`).
+/// Find or prepare the directory to create per-run cgroups in. Missing
+/// controllers aren't an error: a bare child cgroup still reports CPU for
+/// the tree, and only the memory side degrades (see
+/// `RunCgroup::has_memory_cap` and `has_memory_peak`).
 pub fn setup(explicit: Option<&Path>) -> io::Result<PathBuf> {
     let env_dir = std::env::var_os("TALLYRUN_CGROUP_DIR").map(PathBuf::from);
     if let Some(dir) = explicit.map(Path::to_path_buf).or(env_dir) {
-        // A prepared dir has no member processes, so no vacating: just make
-        // sure child accounting is on (best effort — must be inside the
-        // caller's delegated subtree).
+        // A prepared dir has no processes to move. Try to enable the
+        // controllers; that only works inside a subtree delegated to us.
         if !subtree_has(&dir, "memory") {
             for set in CONTROLLER_SETS {
                 if fs::write(dir.join("cgroup.subtree_control"), set).is_ok() {
@@ -103,20 +101,20 @@ pub fn setup(explicit: Option<&Path>) -> io::Result<PathBuf> {
     }
 
     let own = self_cgroup()?;
-    // Born inside the leaf (a previous invocation vacated our parent): run
-    // cgroups go next to the leaf, and the dance is already done.
+    // Inside the leaf means an earlier run already moved our parent there and
+    // did the setup, so run cgroups go next to the leaf.
     let base = if own.file_name().is_some_and(|n| n == INIT_LEAF) {
         own.parent().unwrap().to_path_buf()
     } else {
         own
     };
     if !subtree_has(&base, "memory") {
-        let _ = vacate_and_enable(&base); // best effort; bare cgroup still works
+        let _ = vacate_and_enable(&base); // best effort; a bare cgroup still works
     }
     Ok(base)
 }
 
-/// One `name value` line of a flat-keyed cgroup file such as cpu.stat.
+/// The value of `name` in a flat-keyed cgroup file such as cpu.stat.
 fn stat_field(stat: &str, name: &str) -> Option<u64> {
     stat.lines()
         .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
@@ -131,16 +129,16 @@ pub struct CpuTimes {
     pub system: u64,
 }
 
-/// A throwaway cgroup for one sandboxed execution.
+/// A cgroup for one run, removed on drop.
 pub struct RunCgroup {
     path: PathBuf,
 }
 
 impl RunCgroup {
     pub fn create(base: &Path) -> io::Result<RunCgroup> {
-        // pid + counter is unique among live threads of one process (the
-        // embeddable `run()` may race itself); nanos guard against a stale
-        // dir left by a crashed run whose pid got recycled.
+        // pid + counter stays unique when several threads of one process call
+        // `run()` at once. The nanoseconds avoid a stale dir left by a crashed
+        // run whose pid was reused.
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -151,9 +149,9 @@ impl RunCgroup {
         Ok(RunCgroup { path })
     }
 
-    /// Cap real RSS. swap.max=0 first: without it the kernel pushes
-    /// over-limit pages to swap and throttles instead of OOM-killing, so an
-    /// over-limit run just runs slowly rather than being caught.
+    /// Cap real RSS. swap.max goes to 0 first; otherwise the kernel swaps and
+    /// throttles an over-limit run instead of OOM-killing it, and the run just
+    /// gets slow.
     pub fn set_memory_max(&self, kb: u64) {
         let _ = fs::write(self.path.join("memory.swap.max"), "0");
         let _ = fs::write(
@@ -166,24 +164,23 @@ impl RunCgroup {
         let _ = fs::write(self.path.join("pids.max"), n.to_string());
     }
 
-    /// Pin the subtree to one CPU. Kernel-enforced, unlike sched_setaffinity,
-    /// which any member could simply widen back. Errors surface to the caller
-    /// because the backstop may only assume one core if this took effect.
+    /// Pin the tree to one CPU. Unlike sched_setaffinity, this can't be
+    /// widened back from inside. Returns the error because the backstop may
+    /// only assume one core if the pin worked.
     pub fn set_cpus(&self, cpu: u32) -> io::Result<()> {
         fs::write(self.path.join("cpuset.cpus"), cpu.to_string())
     }
 
-    /// Whether the memory *cap* is live here (memory.max present). Distinct
-    /// from [`has_memory_peak`](Self::has_memory_peak): memory.max landed
-    /// long before memory.peak (kernel 5.19), so a 5.9–5.18 kernel (RHEL 9's
-    /// 5.14) can enforce the cap while peak reporting degrades to rusage —
-    /// conflating the two made such kernels fall back to RLIMIT_AS, which
-    /// over-counts virtual space and spuriously kills the JVM and CPython.
+    /// Whether memory.max exists, so the cap works. memory.peak only arrived
+    /// in 5.19, so a 5.9-5.18 kernel (RHEL 9 ships 5.14) can enforce the cap
+    /// but can't report the peak. Such kernels must still skip RLIMIT_AS,
+    /// which counts virtual address space and kills the JVM and CPython for
+    /// no good reason.
     pub fn has_memory_cap(&self) -> bool {
         self.path.join("memory.max").exists()
     }
 
-    /// Whether peak-RSS reporting is live here (memory.peak, kernel 5.19+).
+    /// Whether memory.peak exists (kernel 5.19+).
     pub fn has_memory_peak(&self) -> bool {
         self.path.join("memory.peak").exists()
     }
@@ -197,9 +194,9 @@ impl RunCgroup {
         stat_field(&stat, "usage_usec").map(|us| us / 1000)
     }
 
-    /// Subtree CPU time from cpu.stat, in microseconds. `total` is the
+    /// CPU time for the tree from cpu.stat, in microseconds. `total` is the
     /// scheduler's exact runtime; the user/system split is tick-sampled and
-    /// scaled by the kernel to sum to it.
+    /// scaled by the kernel to add up to it.
     pub fn cpu_usec(&self) -> Option<CpuTimes> {
         let stat = fs::read_to_string(self.path.join("cpu.stat")).ok()?;
         Some(CpuTimes {
@@ -214,14 +211,14 @@ impl RunCgroup {
         s.trim().parse::<i64>().ok().map(|b| b / 1024)
     }
 
-    /// SIGKILL the whole subtree atomically — fork-bomb-proof teardown.
+    /// SIGKILL the whole tree in one step, which a fork bomb can't outrun.
     pub fn kill_all(&self) {
         let _ = fs::write(self.path.join("cgroup.kill"), "1");
     }
 }
 
-/// Teardown on drop: kill anything left, then poll rmdir until the kernel
-/// has reaped the dying tasks. Read metrics before letting this run.
+/// Kills whatever is left and retries rmdir until the kernel has reaped the
+/// dying tasks. Read the metrics before dropping.
 impl Drop for RunCgroup {
     fn drop(&mut self) {
         self.kill_all();

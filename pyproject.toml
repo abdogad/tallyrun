@@ -1,4 +1,4 @@
-# Test tooling only — the engine is the Rust crate (Cargo.toml). The pytest
-# suite drives the release binary through its CLI JSON contract.
+# Only test config lives here; tallyrun itself is the Rust crate. pytest runs
+# the release binary through its CLI.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
