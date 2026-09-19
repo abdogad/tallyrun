@@ -5,6 +5,8 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-19
+
 ### Added
 
 - JSON fields `cpu_us`, `cpu_user_us`, `cpu_sys_us`, and `wall_us`:
@@ -17,6 +19,29 @@ versions follow [SemVer](https://semver.org/) (0.x: minor bumps may change behav
   low; before this, that undercount was silent.
 - `--extra-counters` adds user-space L1 data-cache, cache, dTLB and branch
   miss counts (JSON `counters`), for cost models beyond instructions.
+
+### Security
+
+- `--stdin`, `--stdout` and `--stderr` paths are opened with `O_NOFOLLOW`,
+  and a symlink is refused (exit 3). tallyrun opens these files on the host
+  as the calling user, so a symlink left in the box by an earlier
+  `--writable` run could truncate any file that user can write, or feed
+  any file it can read to the payload.
+- File descriptors the caller had open are closed before exec, so they no
+  longer leak into the sandbox. An inherited directory fd was enough to
+  reach files outside the sandbox through `openat()`.
+
+### Changed
+
+- `--stdout /dev/stdout` and `--stderr /dev/stdout` now fail with exit 3.
+  tallyrun prints its JSON result on stdout, and a line the program wrote
+  there could pass for it. In the library, `SandboxSpec::default()` now
+  discards stdout (`/dev/null`) like the CLI does.
+
+### Fixed
+
+- A `--mem-kb` too large to convert to bytes no longer wraps around to a
+  wrong `memory.max`.
 
 ## [0.5.0] - 2026-07-06
 
@@ -174,7 +199,8 @@ First release.
 - Reference judge in [examples/minijudge](examples/minijudge); benchmark
   harness in `bench/`; static musl release binary.
 
-[Unreleased]: https://github.com/abdogad/tallyrun/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/abdogad/tallyrun/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.6.0
 [0.5.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.5.0
 [0.4.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.4.0
 [0.3.0]: https://github.com/abdogad/tallyrun/releases/tag/v0.3.0

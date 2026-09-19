@@ -1,6 +1,6 @@
 [package]
 name = "tallyrun"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Rootless sandbox that judges untrusted code by counting CPU instructions instead of seconds — same verdict on a busy machine as on an idle one."
 license = "MIT"
